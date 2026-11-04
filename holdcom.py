@@ -314,7 +314,7 @@ def selftest():
 def build_parser():
     p = argparse.ArgumentParser(
         prog="holdcom.py",
-        description="On-demand serial take-over without resetting the MCU.")
+        description="On-demand serial take-over without resetting the MCU. No command given = interactive console.")
     p.add_argument("-p", "--port", help="serial port (e.g. /dev/cu.usbserial-*)")
     p.add_argument("-b", "--baud", type=int, default=None,
                    help="set baud rate (optional; default = inherit driver setting)")
@@ -336,7 +336,7 @@ def build_parser():
     rr = sub.add_parser("recv")
     rr.add_argument("-t", "--timeout", type=float, default=1.0)
     sub.add_parser("status")
-    sub.add_parser("console")
+    sub.add_parser("console", help="interactive console (default when no command given)")
     sub.add_parser("selftest")
     return p
 
@@ -353,9 +353,9 @@ def main(argv=None):
     if not args.port and args.cmd != "selftest":
         sys.stderr.write("error: -p/--port is required (except for selftest)\n")
         return 2
+    # picocom-like: no subcommand given => default to interactive console.
     if args.cmd is None:
-        sys.stderr.write("error: no command given\n")
-        return 2
+        args.cmd = "console"
 
     if args.cmd == "send":
         fd = open_safe(args.port, args.baud, args.raw, idle_dtr, idle_rts)

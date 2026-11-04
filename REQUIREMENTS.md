@@ -45,6 +45,8 @@
   不引入常驻 socket server、不做 daemon、不共享端口。
   理由：最简单、最贴合"想接管就接管、用完释放、全程不复位"；
   AI 侧只需 spawn 进程或 import，无需任何常驻中间层。
+  CLI 语义仿 picocom：**不传子命令即默认进入 interactive console**；
+  `send` / `recv` / `recv-until` / `status` / `selftest` 为显式子命令（给 AI 程序化用）。
 
 ## 已拍板：空闲安全态（决策 B，已按实机修正）
 - **默认零触碰**：`open_safe` 默认**不调用** `set_idle_state()`，即不发出任何
