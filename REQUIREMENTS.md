@@ -60,7 +60,7 @@
 ## picocom 子仓库
 - `picocom/` 作为 **git submodule** 引入，**仅作参考阅读**，不编译、不链接、
   不拷贝其代码，因此不会把 GPL-2.0 传染进本工具。
-- 本工具的 `serial_takeover.py` 是 clean-room 实现，只借鉴 picocom 的 termios/ioctl
+- 本工具的 `holdcom.py` 是 clean-room 实现，只借鉴 picocom 的 termios/ioctl
   思路与行为语义（--noinit / --noreset / 接管后设空闲态），不复制代码。
 
 ## 交付约束

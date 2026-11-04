@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""serial_takeover.py — minimal on-demand serial take-over that never resets
+"""holdcom.py — minimal on-demand serial take-over that never resets
 the MCU on take-over/release.
 
 Design (see REQUIREMENTS.md):
@@ -313,7 +313,7 @@ def selftest():
 
 def build_parser():
     p = argparse.ArgumentParser(
-        prog="serial_takeover.py",
+        prog="holdcom.py",
         description="On-demand serial take-over without resetting the MCU.")
     p.add_argument("-p", "--port", help="serial port (e.g. /dev/cu.usbserial-*)")
     p.add_argument("-b", "--baud", type=int, default=None,
