@@ -5,8 +5,10 @@
 > being requested and have been **removed**. This contract now covers **only what
 > was asked**: a reliable entry point for AI and the user to take over a USB
 > serial port, where **occupy (connect)** and **release (disconnect)** never
-> touch DTR/RTS and therefore never reset the target MCU. Deliberate modem
-> actions may be added later **only after explicit confirmation**.
+> touch DTR/RTS and therefore never reset the target MCU **on connect/disconnect**.
+> The gateway's own one-time launch `open()` produces the only unavoidable modem
+> pulse (see §1, §6). Deliberate modem actions may be added later **only after
+> explicit confirmation**.
 
 This is a **generic** serial-takeover tool. No specific target hardware,
 project, or personal context is assumed.
@@ -23,8 +25,17 @@ as a length-framed block or as hex on a single line (see `DATA` / `DATAHEX`).
 Neither action opens/closes the serial port (the gateway owns it), so neither
 affects DTR/RTS. This is the core guarantee.
 
-One client acts as the **controller** (may send); others may **subscribe** as
-**monitors** (RX broadcast only).
+> **Scope of the guarantee (important).** The guarantee covers **client
+> occupy/release only**. The gateway itself performs exactly one `open()` at
+> launch; that single open makes the kernel driver assert DTR/RTS once. This
+> launch-time pulse is unavoidable (driver behaviour, see `DESIGN.md` §1) and is
+> a one-time, operator-initiated event — not something that recurs on connect/
+> disconnect. We do **not** claim "zero resets under all circumstances"; we claim
+> "repeated connect/disconnect never resets the target."
+
+Exactly one client is the **controller** (may `SEND`); others may **subscribe**
+as **monitors** (RX broadcast only). A second client that issues `SEND` while a
+controller exists receives `BUSY`; the gateway enforces a single sender.
 
 ### 1.1 Client → Gateway commands
 
@@ -53,14 +64,18 @@ One client acts as the **controller** (may send); others may **subscribe** as
 | `MODEM DTR=x RTS=x CTS=x DSR=x` | Read-only modem states (x∈{0,1}). |
 | `STATUS <key=value ...>` | Status snapshot. |
 | `PONG` | Reply to `PING`. |
-| `RX <line>` | Broadcast to subscribers: a received line. |
-| `EVENT <type>` | Async event (e.g. `DISCONNECT`, `RECONNECT`). |
+| `RX <len>` | Broadcast to subscribers: `<len>` raw received bytes + trailing LF (binary-safe, mirrors `DATA`). Client renders as text/hex. |
+| `RXHEX <hex>` | Single-line hex variant of the broadcast (AI-friendly). |
+| `BUSY` | Request rejected: another client holds the controller role (or transient block). |
+| `EVENT <type>` | Async event (e.g. `DISCONNECT`, `RECONNECT`, `PORT_LOST`, `PORT_RESTORED`). |
 
 ### 1.3 Data framing rules
 
 - `DATA <len>\n<bytes>\n`: `<len>` decimal byte count; reader consumes exactly
   `<len>` bytes after the header, then the terminating LF.
 - `DATAHEX <hex>\n`: whole received buffer as hex on one line (AI-friendly).
+- Broadcast frames use the same `<len>`/hex encoding so binary (no LF, embedded
+  control chars) is carried losslessly.
 
 ---
 
@@ -103,7 +118,7 @@ typedef struct {
 
 /* Blocking: owns the poll() loop over [serial fd, listen fd, client fds],
    dispatches the wire protocol, broadcasts RX. Client connect/disconnect never
-   touches the serial port's modem lines. */
+   touches the serial port's modem lines. Enforces a single controller. */
 int server_run(const server_cfg_t *cfg);
 ```
 
@@ -146,8 +161,9 @@ uart-cli attach            # interactive console (see below)
 The human-facing use of the same entry point. **No new gateway command is
 required** — `attach` is pure client-side wiring of already-frozen primitives:
 
-- On start: send `SUBSCRIBE` so the gateway broadcasts every serial RX line to
-  this client; print each `RX <line>` to the terminal in real time.
+- On start: send `SUBSCRIBE` so the gateway broadcasts every received chunk as a
+  binary-safe `RX <len>` frame; render each to the terminal in real time (text
+  where printable, escaped otherwise).
 - Put the **local** terminal into raw/cbreak mode (no OS line editing, no
   cooked echo) so each keystroke is forwarded immediately.
 - Each keystroke (or keystroke group) is sent to the device via `SEND` (printable
@@ -184,6 +200,13 @@ uart-gateway -p <port> -b <baud> -s <sock_path>
 Signal handling: `SIGINT`/`SIGTERM` → restore safe state, clear `TIOCEXCL`,
 close fd, remove socket. No DTR drop on exit (`HUPCL=0`).
 
+> **Safe-state misconfiguration warning.** The safe DTR/RTS levels depend on the
+> target's reset/boot circuit, which the gateway cannot discover. If `-P`/`-R`
+> polarity is set wrong, the gateway may hold the target in permanent reset or
+> force boot mode. Always confirm with `GET_MODEM` (and, if possible, observe the
+> target) before relying on the gateway. Defaults assume an active-low circuit
+> (safe = both lines high).
+
 ---
 
 ## 6. Invariants (must hold in every implementation)
@@ -194,8 +217,12 @@ close fd, remove socket. No DTR drop on exit (`HUPCL=0`).
 3. `HUPCL=0` → gateway release/exit does not drop DTR → no reset on release.
 4. DTR/RTS held in safe state by default; client connect/disconnect never moves
    them. (Any deliberate modem action, if ever added, is explicit and user-initiated.)
-5. The only unavoidable pulse is the single `open()` at launch (kernel-driven);
-   it is a one-time, user-controlled event.
+5. The **only** unavoidable modem pulse is the single `open()` at gateway launch
+   (kernel/driver driven, verified against picocom source — see `DESIGN.md` §1);
+   it is one-time and operator-initiated, and does **not** recur on client
+   connect/disconnect. The guarantee is therefore "no reset on occupy/release",
+   not "zero resets under all circumstances".
 6. Clean-room: no picocom code copied/linked (GPL-2.0). `picocom-src` is a
    read-only reference submodule only.
 7. Local Unix socket only. No TCP / remote transport.
+8. Single controller enforced: only one client may `SEND`; others are monitors.

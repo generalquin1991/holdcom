@@ -6,9 +6,11 @@
 > (removed 2026-11-04 — they were never requested).
 
 Line-based, UTF-8 text protocol over a **Unix domain socket** (default
-`/tmp/uart-gateway.sock`). One client is the *controller*; others may subscribe
-as *monitors* (RX broadcast). **Occupy = connect, release = disconnect** — neither
-touches the serial port, so neither affects DTR/RTS.
+`/tmp/uart-gateway.sock`). **Exactly one client is the *controller*** (may `SEND`);
+others may subscribe as *monitors* (RX broadcast only). A second client that
+issues `SEND` while a controller exists receives `BUSY`. **Occupy = connect,
+release = disconnect** — neither touches the serial port, so neither affects
+DTR/RTS.
 
 All frames `\n`-terminated. The binary framing rules (`DATA <len>` block vs
 `DATAHEX` single line) are in `INTERFACE.md` §1.3.
@@ -36,8 +38,14 @@ All frames `\n`-terminated. The binary framing rules (`DATA <len>` block vs
 - `MODEM DTR=x RTS=x CTS=x DSR=x` — read-only modem states.
 - `STATUS <key=value ...>` — status snapshot.
 - `PONG` — reply to `PING`.
-- `RX <line>` — broadcast to subscribers: a received line.
-- `EVENT <type>` — async event (e.g. `DISCONNECT`, `RECONNECT`).
+- `RX <len>` then `<len>` bytes — broadcast to subscribers: a received chunk,
+  binary-safe (mirrors `DATA`). Client renders as text/hex.
+- `RXHEX <hex>` — single-line hex variant of the broadcast (AI-friendly).
+- `BUSY` — request rejected: another client holds the controller role (or a
+  transient condition blocks the action).
+- `EVENT <type>` — async event. Types include `DISCONNECT`, `RECONNECT`,
+  `PORT_LOST` (serial device disappeared, e.g. USB unplug), `PORT_RESTORED`
+  (device reappeared, gateway re-opened and re-asserted safe state).
 - `ERR <reason>` — command failed.
 
 ## Behaviour guarantees (the reason this project exists)
@@ -51,4 +59,7 @@ All frames `\n`-terminated. The binary framing rules (`DATA <len>` block vs
   current scope.)
 - The single `open()` at launch still produces one pulse (kernel asserts DTR/RTS
   on open — see picocom `lowerrts.md`); it is a one-time, user-controlled event
-  (start the gateway when ready to attach).
+  (start the gateway when ready to attach). The guarantee is therefore **"no
+  reset on connect/disconnect"**, not "zero resets under all circumstances".
+- On `PORT_LOST` the gateway holds the safe state and rejects client I/O until
+  `PORT_RESTORED`; recovery stays exclusive.

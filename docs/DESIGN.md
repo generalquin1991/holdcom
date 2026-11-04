@@ -38,7 +38,7 @@ AI never opens the serial port. The gateway opens it **once**, holds it
 **exclusively**, and exposes a socket API. **Occupy = connect, release =
 disconnect** — neither opens/closes the port, so neither affects DTR/RTS.
 
-## 3. Guarantees (how the reset is *fully* eliminated)
+## 3. Guarantees (how resets on connect/disconnect are eliminated)
 
 | # | Mechanism | Effect |
 |---|----------|--------|
@@ -49,7 +49,10 @@ disconnect** — neither opens/closes the port, so neither affects DTR/RTS.
 | 5 | On USB replug, gateway re-opens and re-asserts safe state | recovery stays exclusive |
 
 The only unavoidable pulse is the single `open()` at gateway launch (kernel-
-driven, see §1). It is a one-time, user-controlled event.
+driven, see §1). It is a one-time, user-controlled event. The guarantee is
+"no reset on connect/disconnect", **not** "zero resets under all circumstances":
+the launch open itself pulses once. This is documented explicitly in
+[`INTERFACE.md`](./INTERFACE.md) §1 and §6.
 
 ## 4. Implementation plan (modules)
 
@@ -57,10 +60,11 @@ driven, see §1). It is a one-time, user-controlled event.
   implements termios + `ioctl(TIOCMBIS/TIOCMBIC/TIOCMGET/TIOCEXCL)` ourselves,
   NOT copied from picocom.
 - `gateway/server.{c,h}` — socket server, event loop, protocol dispatch,
-  RX broadcast, multiple clients (1 controller + monitors).
-- `gateway/main.c` — arg parsing, glue.
+  RX broadcast (binary-safe), multiple clients (1 controller + monitors),
+  enforce single controller, hotplug detection.
+- `gateway/main.c` — arg parsing, glue, signal handling.
 - `client/uart_client.py` — pure-socket client (no pyserial).
-- `client/cli.py` — CLI wrapper.
+- `client/cli.py` — CLI wrapper (+ `attach` interactive console).
 - `docs/INTERFACE.md` — frozen interface contract (wire + C API + Python API +
   CLI + config).
 - `docs/PROTOCOL.md` — wire-protocol deep-dive (mirrors `INTERFACE.md` §1).
@@ -80,7 +84,34 @@ picocom (`picocom-src/LICENSE.txt`) is **GPL-2.0**. We therefore:
   abandoned clean-room and vendored a *modified* picocom (would reintroduce
   GPL — explicitly avoided).
 
-## 6. Status
+## 6. Acceptance criteria
+
+"Done" is defined by these checks. **Execution of any check that touches a real
+USB-UART adapter or target MCU is deferred until explicitly permitted**; the
+procedure is specified now so it can be run unchanged later.
+
+1. **No modem movement on occupy/release.** With a real USB-UART adapter, a second
+   observer process samples `TIOCMGET` DTR/RTS while a client connects and
+   disconnects 100×. Assert: DTR/RTS unchanged across every transition.
+2. **Single launch pulse only.** Observer samples DTR/RTS across gateway start.
+   Assert: exactly one assertion pulse at `open()`, then stable at safe state;
+   no further pulses during the session.
+3. **Byte-faithful loopback.** Echo server on the port; client `SEND`/`RECV`
+   round-trip returns identical bytes (incl. binary) — validates `DATA`/`DATAHEX`
+   and binary-safe `RX` broadcast.
+4. **Console.** `uart-cli attach` shows live output and forwards keystrokes
+   (incl. Ctrl-C via `SENDHEX`); Ctrl-] detaches; port not reset after detach.
+5. **Hotplug.** Unplug + replug the adapter while gateway runs: gateway detects
+   loss, holds safe state, rejects client I/O meanwhile, re-opens and re-asserts
+   safe state on replug, still exclusive (`TIOCEXCL`).
+6. **Exclusivity.** A `pyserial`/any process cannot `open()` the port while the
+   gateway holds it (assert open fails with EBUSY).
+
+Checks 3–6 can be partially exercised with a pty loopback for logic, but the
+modem-line assertions (1, 2, 6) require a real adapter and are gated on
+permission.
+
+## 7. Status
 
 Skeleton only. Directory layout, Makefile, headers, interface/design docs are in
 place. **Core logic (serial termios/ioctl, socket event loop, protocol parser,
