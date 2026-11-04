@@ -76,6 +76,18 @@
     `ESP-ROM…rst:0x15 (USB_UART_CHIP_RESET)`，进 bootloader——证明某些 DTR/RTS
     组合确实会复位，故默认必须"零触碰"而非"默认 high"。
   - `--idle-rts low`（`0x0002`）：无复位签名。
+- **接管/释放循环无复位（close 不掉线，已实机闭合）**：
+  之前"close 不掉 DTR/RTS"仅代码层由 `HUPCL=0` 保证、未实机验证，现已闭合。
+  用 `console` 子命令对同一端口连续做了 **3 次 attach→release** 循环（仅读运行中
+  app 日志，无任何写操作、无 `TIOCM*` 翻转、未烧录）。关键证据是目标固件日志的
+  自启动毫秒计时器 `I (N)` 全程**单调递增、零归零**：
+  - 第 1 段 release 前最后读到 `I (5062)`
+  - 第 2 段 attach 后首行 `I (323406)` —— 与第 1 段连续，说明 release 未复位
+  - 第 3 段 attach 后首行 `I (331943)` —— 与第 2 段连续，说明第 2 段 release 也未复位
+  若 `close()` 因未清 `HUPCL` 而掉 DTR/RTS（复位沿），或 `open()` 的断言脉冲触发复位，
+  `N` 必在某次 attach/release 归零；三次循环全连续 → 直接证明：
+  (1) attach 不复位（内核 open 默认线态在本驱动不构成复位沿）；
+  (2) release 不复位（`HUPCL=0` 生效，close 不掉线）。
 - **验证方法**（未落盘，按需复用）：对每种 idle 配置执行
   `open_safe → TIOCMGET 读线态 → 3s 收数 → 扫描复位签名（ESP-ROM / rst:0x /
   boot: 等）→ close_safe`；`selftest` 静态扫描仍通过（TIOCM 仅在 `set_idle_state`，
