@@ -43,12 +43,12 @@ controller exists receives `BUSY`; the gateway enforces a single sender.
 |---------|------|---------|
 | `SEND <text>` | text (no embedded LF) | Transmit text; trailing `\r\n` per `send-crlf` config. |
 | `SENDHEX <hex>` | even-length hex | Transmit raw bytes (AI-safe). |
-| `RECV <timeout_ms>` | ms | Return received bytes up to timeout → `DATA` frame. |
+| `RECV <timeout_ms>` | ms | Return buffered received bytes up to timeout → `DATA` frame. |
 | `RECV_HEX <timeout_ms>` | ms | Like `RECV`, reply `DATAHEX <hex>` (single line). |
-| `RECV_UNTIL <pattern> <timeout_ms>` | pattern, ms | Block until `<pattern>` seen or timeout. |
+| `RECV_UNTIL <pattern> <timeout_ms>` | pattern, ms | Block until `<pattern>` seen in the buffer or timeout. |
 | `GET_MODEM` | — | Reply `MODEM DTR=x RTS=x CTS=x DSR=x` (read-only). |
-| `STATUS` | — | Report port/baud/DTR/RTS/open/uptime. |
-| `SUBSCRIBE` | — | Register as RX broadcast subscriber. |
+| `STATUS` | — | Report state (keys in §5). |
+| `SUBSCRIBE` | — | Register as RX broadcast subscriber (forward-only). |
 | `UNSUBSCRIBE` | — | Cancel RX subscription. |
 | `PING` | — | Health check → `PONG`. |
 | `QUIT` | — | Close this client connection (= release entry point). |
@@ -62,12 +62,12 @@ controller exists receives `BUSY`; the gateway enforces a single sender.
 | `DATA <len>` | Header; then `<len>` raw bytes + trailing LF. |
 | `DATAHEX <hex>` | Single-line hex-encoded received bytes. |
 | `MODEM DTR=x RTS=x CTS=x DSR=x` | Read-only modem states (x∈{0,1}). |
-| `STATUS <key=value ...>` | Status snapshot. |
+| `STATUS <key=value ...>` | Status snapshot (keys in §5). |
 | `PONG` | Reply to `PING`. |
 | `RX <len>` | Broadcast to subscribers: `<len>` raw received bytes + trailing LF (binary-safe, mirrors `DATA`). Client renders as text/hex. |
 | `RXHEX <hex>` | Single-line hex variant of the broadcast (AI-friendly). |
-| `BUSY` | Request rejected: another client holds the controller role (or transient block). |
-| `EVENT <type>` | Async event (e.g. `DISCONNECT`, `RECONNECT`, `PORT_LOST`, `PORT_RESTORED`). |
+| `BUSY` | Request rejected: another client holds the controller role (or a transient condition blocks the action). |
+| `EVENT <type>` | Async event. Types: `DISCONNECT`, `RECONNECT`, `PORT_LOST`, `PORT_RESTORED`, `OVERFLOW` (RX ring dropped oldest). |
 
 ### 1.3 Data framing rules
 
@@ -76,6 +76,25 @@ controller exists receives `BUSY`; the gateway enforces a single sender.
 - `DATAHEX <hex>\n`: whole received buffer as hex on one line (AI-friendly).
 - Broadcast frames use the same `<len>`/hex encoding so binary (no LF, embedded
   control chars) is carried losslessly.
+
+### 1.4 RX buffering & delivery model
+
+The gateway maintains a **ring buffer** of all received serial bytes (default
+64 KiB). This resolves the send-then-receive race:
+
+- `RECV` / `RECV_HEX` / `RECV_UNTIL` **drain from the ring buffer**, so a client
+  that issues `SEND` and only later calls `RECV` still retrieves the response.
+- `SUBSCRIBE` is **forward-only**: a subscriber receives bytes received *after*
+  subscription, not the buffered history.
+- On ring overflow the oldest bytes are dropped and `EVENT OVERFLOW` is emitted.
+
+### 1.5 Controller role & state
+
+- A single **controller slot** exists. It is granted to the first client that
+  issues `SEND` while the slot is free.
+- The slot is released when that client disconnects or sends `QUIT`.
+- A `SEND` from any other client while the slot is held is rejected with `BUSY`.
+- Monitors (subscribers) can never `SEND`.
 
 ---
 
@@ -118,7 +137,8 @@ typedef struct {
 
 /* Blocking: owns the poll() loop over [serial fd, listen fd, client fds],
    dispatches the wire protocol, broadcasts RX. Client connect/disconnect never
-   touches the serial port's modem lines. Enforces a single controller. */
+   touches the serial port's modem lines. Enforces a single controller
+   (§1.5) and handles hotplug (PORT_LOST / PORT_RESTORED). */
 int server_run(const server_cfg_t *cfg);
 ```
 
@@ -166,9 +186,10 @@ required** — `attach` is pure client-side wiring of already-frozen primitives:
   where printable, escaped otherwise).
 - Put the **local** terminal into raw/cbreak mode (no OS line editing, no
   cooked echo) so each keystroke is forwarded immediately.
-- Each keystroke (or keystroke group) is sent to the device via `SEND` (printable
-  text) or `SENDHEX` (control bytes such as `0x03` / Ctrl-C). Behaviour is
-  identical to the AI `send()` path — it does **not** touch DTR/RTS.
+- Each keystroke (or keystroke group) is sent via `SEND` (printable text) or
+  `SENDHEX` (control bytes such as `0x03` / Ctrl-C). **Ctrl-C is forwarded to the
+  device, not used to kill the client.** The client only intercepts the escape
+  key.
 - An escape key (default `Ctrl-]`) detaches: send `UNSUBSCRIBE` then `QUIT`.
 - Because occupy/release are just socket connect/disconnect, opening or leaving
   the console never resets the target — exactly the guarantee this tool exists
@@ -184,18 +205,23 @@ interactive use.
 ```
 uart-gateway -p <port> -b <baud> -s <sock_path>
              [-P <dtr_polarity>] [-R <rts_polarity>]
-             [--send-crlf] [--daemon]
+             [--send-crlf] [--daemon] [-l <logfile|stderr>]
 ```
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `-p` | required | Serial device path. |
+| `-p` | required | Serial device path. On macOS use a `/dev/cu.*` callout device (not `/dev/tty.*`). May be absent at start (gateway waits for hotplug). |
 | `-b` | `115200` | Baud rate. |
-| `-s` | `/tmp/uart-gateway.sock` | Unix socket path. |
+| `-s` | `/tmp/uart-gateway.sock` | Unix socket path. `chmod 0600`. On start, if it exists the gateway probes it; if a live gateway answers it exits ("already running"), else it unlinks the stale file and binds. |
 | `-P` | `0` | DTR polarity for safe state (0=low-active→safe=high). |
 | `-R` | `0` | RTS polarity for safe state. |
 | `--send-crlf` | off | Append `\r\n` to `SEND` text. |
 | `--daemon` | off | Detach into background. |
+| `-l` | `stderr` | Lifecycle log destination. |
+
+`STATUS` keys (exact): `port`, `baud`, `open` (0/1), `uptime_s`, `clients`,
+`controller` (client id or `none`), `rx_bytes`, `tx_bytes`, `buf_used`,
+`safe_dtr`, `safe_rts`.
 
 Signal handling: `SIGINT`/`SIGTERM` → restore safe state, clear `TIOCEXCL`,
 close fd, remove socket. No DTR drop on exit (`HUPCL=0`).
@@ -226,3 +252,5 @@ close fd, remove socket. No DTR drop on exit (`HUPCL=0`).
    read-only reference submodule only.
 7. Local Unix socket only. No TCP / remote transport.
 8. Single controller enforced: only one client may `SEND`; others are monitors.
+9. RX is buffered (§1.4) so `RECV` after `SEND` never races; subscribers are
+   forward-only.

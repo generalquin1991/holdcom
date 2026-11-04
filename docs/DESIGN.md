@@ -54,20 +54,27 @@ driven, see §1). It is a one-time, user-controlled event. The guarantee is
 the launch open itself pulses once. This is documented explicitly in
 [`INTERFACE.md`](./INTERFACE.md) §1 and §6.
 
-## 4. Implementation plan (modules)
+## 4. Implementation plan (modules + order)
+
+Modules:
 
 - `gateway/serial.{c,h}` — port ownership & modem lines. **Clean-room**:
   implements termios + `ioctl(TIOCMBIS/TIOCMBIC/TIOCMGET/TIOCEXCL)` ourselves,
   NOT copied from picocom.
 - `gateway/server.{c,h}` — socket server, event loop, protocol dispatch,
-  RX broadcast (binary-safe), multiple clients (1 controller + monitors),
-  enforce single controller, hotplug detection.
+  RX buffering + broadcast (binary-safe), single-controller enforcement,
+  hotplug detection, stale-socket handling, logging.
 - `gateway/main.c` — arg parsing, glue, signal handling.
 - `client/uart_client.py` — pure-socket client (no pyserial).
 - `client/cli.py` — CLI wrapper (+ `attach` interactive console).
 - `docs/INTERFACE.md` — frozen interface contract (wire + C API + Python API +
   CLI + config).
 - `docs/PROTOCOL.md` — wire-protocol deep-dive (mirrors `INTERFACE.md` §1).
+- `docs/PLAN.md` — **risk-first, ordered** implementation plan with per-phase
+  exit criteria (Phase 0 proves the modem guarantee before any UI is built).
+
+The detailed, dependency-ordered build sequence (Phase 0 → 5) is in
+[`PLAN.md`](./PLAN.md).
 
 ## 5. License decision (picocom is GPL-2.0)
 
@@ -93,6 +100,9 @@ procedure is specified now so it can be run unchanged later.
 1. **No modem movement on occupy/release.** With a real USB-UART adapter, a second
    observer process samples `TIOCMGET` DTR/RTS while a client connects and
    disconnects 100×. Assert: DTR/RTS unchanged across every transition.
+   *Hardware-free proxy:* `strace -e ioctl` the gateway during 100 client
+   connect/disconnect cycles; assert no `TIOCMSET`/`TIOCMBIS`/`TIOCMBIC` touching
+   modem bits occurs. This can run without permission.
 2. **Single launch pulse only.** Observer samples DTR/RTS across gateway start.
    Assert: exactly one assertion pulse at `open()`, then stable at safe state;
    no further pulses during the session.
@@ -109,13 +119,13 @@ procedure is specified now so it can be run unchanged later.
 
 Checks 3–6 can be partially exercised with a pty loopback for logic, but the
 modem-line assertions (1, 2, 6) require a real adapter and are gated on
-permission.
+permission. Check 1's `strace` proxy needs no hardware.
 
 ## 7. Status
 
-Skeleton only. Directory layout, Makefile, headers, interface/design docs are in
-place. **Core logic (serial termios/ioctl, socket event loop, protocol parser,
-client implementation) is NOT yet written.** Real-device testing deferred until
-explicitly permitted. The interface contract is frozen in
+Skeleton only. Directory layout, Makefile, headers, interface/design/plan docs
+are in place. **Core logic (serial termios/ioctl, socket event loop, protocol
+parser, client implementation) is NOT yet written.** Real-device testing
+deferred until explicitly permitted. The interface contract is frozen in
 [`INTERFACE.md`](./INTERFACE.md) (minimal scope — flash / deliberate modem
 commands removed as out of scope).
