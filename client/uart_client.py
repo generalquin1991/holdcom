@@ -24,10 +24,8 @@ DEFAULT_SOCK = "/tmp/uart-gateway.sock"
 
 
 class UartClient:
-    def __init__(self, sock_path=DEFAULT_SOCK, tcp_host=None, tcp_port=0, timeout=5.0):
+    def __init__(self, sock_path=DEFAULT_SOCK, timeout=5.0):
         self.sock_path = sock_path
-        self.tcp_host = tcp_host
-        self.tcp_port = tcp_port
         self.timeout = timeout
         self._sock = None
 

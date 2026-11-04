@@ -1,8 +1,8 @@
 # Protocol (uart-gateway)
 
 Line-based, UTF-8 text protocol over a **Unix domain socket** (default
-`/tmp/uart-gateway.sock`) and/or an optional **TCP** listener bound to
-`127.0.0.1` only. One client is the *controller* (may send); others may
+local Unix domain socket (default `/tmp/uart-gateway.sock`). One client is the
+*controller* (may send); others may
 subscribe as *monitors* (RX broadcast only). AI tools use the Python
 client (`client/uart_client.py`) — they never touch the serial port.
 

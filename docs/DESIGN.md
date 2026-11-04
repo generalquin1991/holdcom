@@ -23,7 +23,7 @@ reboots the ESP32. That is the exact pain point.
 
 ```
  AI / script (Python client, plain socket, NO pyserial)
-        │  Unix socket / 127.0.0.1:TCP
+        │  local Unix socket
         ▼
  uart-gateway (C daemon)
    socket server → protocol parser → serial mgr

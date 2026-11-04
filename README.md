@@ -24,7 +24,7 @@ AI critical path entirely.
 
 The gateway opens the port **once**, holds it **exclusively**
 (`TIOCEXCL` + `flock`), and never drops `DTR` on exit (`HUPCL=0`). AI tools
-connect over a Unix socket (or `127.0.0.1` TCP) and never touch the port.
+connect over a local Unix socket and never touch the port.
 See `docs/DESIGN.md` and `docs/PROTOCOL.md`.
 
 ## Status: SKELETON
