@@ -34,9 +34,10 @@ See `docs/DESIGN.md`, `docs/PROTOCOL.md`, and the frozen `docs/INTERFACE.md`.
 ## Scope (frozen)
 
 Minimal, explicit scope: a reliable entry point whose occupy/release never
-affects DTR/RTS. Flash / yield (pty proxy) mode and deliberate modem-write
-commands (`SET_DTR`/`SET_RTS`/`RESET`/`BOOT`) are **out of scope** unless
-explicitly requested.
+affects DTR/RTS, usable both programmatically (AI/scripts) and interactively
+(`uart-cli attach` console). Flash / yield (pty proxy) mode and deliberate
+modem-write commands (`SET_DTR`/`SET_RTS`/`RESET`/`BOOT`) are **out of scope**
+unless explicitly requested.
 
 ## Status: SKELETON
 

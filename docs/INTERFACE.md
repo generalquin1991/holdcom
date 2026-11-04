@@ -138,8 +138,28 @@ uart-cli send "AT\r\n"
 uart-cli recv -t 1000
 uart-cli recv-until "OK" -t 5000
 uart-cli status
-uart-cli attach            # interactive terminal (subscribe RX + forward stdin)
+uart-cli attach            # interactive console (see below)
 ```
+
+### 4.1 Interactive console (`attach`)
+
+The human-facing use of the same entry point. **No new gateway command is
+required** — `attach` is pure client-side wiring of already-frozen primitives:
+
+- On start: send `SUBSCRIBE` so the gateway broadcasts every serial RX line to
+  this client; print each `RX <line>` to the terminal in real time.
+- Put the **local** terminal into raw/cbreak mode (no OS line editing, no
+  cooked echo) so each keystroke is forwarded immediately.
+- Each keystroke (or keystroke group) is sent to the device via `SEND` (printable
+  text) or `SENDHEX` (control bytes such as `0x03` / Ctrl-C). Behaviour is
+  identical to the AI `send()` path — it does **not** touch DTR/RTS.
+- An escape key (default `Ctrl-]`) detaches: send `UNSUBSCRIBE` then `QUIT`.
+- Because occupy/release are just socket connect/disconnect, opening or leaving
+  the console never resets the target — exactly the guarantee this tool exists
+  for.
+
+This is the non-resetting replacement for `screen` / `minicom` / `pyserial`'s
+interactive use.
 
 ---
 

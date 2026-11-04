@@ -23,6 +23,7 @@ def main():
     ru = sub.add_parser("recv_until")
     ru.add_argument("pattern"); ru.add_argument("timeout_ms", type=int)
     sub.add_parser("status")
+    sub.add_parser("attach")   # interactive console: SUBSCRIBE + forward stdin
 
     args = p.parse_args()
     print("cli: NOT IMPLEMENTED (skeleton) - would dispatch:", args.cmd, file=sys.stderr)
