@@ -9,15 +9,17 @@ Design (see REQUIREMENTS.md):
   * Each CLI invocation is a self-contained take-over -> act -> release cycle.
 
 The one unavoidable flow-control event is the kernel driver asserting DTR/RTS
-on open(); that is a hardware/OS fact, not something this tool does. On
-take-over we additionally set DTR/RTS exactly ONCE to the idle-safe state
-(default: both asserted/high, which for the common low-active reset circuit
-= released = safe), mirroring how picocom calls set_dtr_rts() after tcsetattr
-(term_apply can reset the lines on some drivers). This happens only at open();
-release (close) and every send/recv never touch the modem lines.
+on open(); that is a hardware/OS fact, not something this tool does. By DEFAULT
+this tool does NOT issue any modem-control ioctl at all — take-over leaves the
+kernel's post-open line state untouched, fully honoring "never touch flow
+control, never reset". The optional --idle-dtr/--idle-rts override sets DTR/RTS
+exactly ONCE at take-over only, for boards whose reset circuit needs a specific
+idle level (e.g. some ESP32-S3 native-USB firmware resets unless RTS is
+deasserted). Release (close) and every send/recv never touch the modem lines.
 
-Static guarantee: TIOCM* ioctls appear ONLY in `set_idle_state` (called once
-from `open_safe`). Enforced by `selftest` (AST scan per function).
+Static guarantee: TIOCM* ioctls appear ONLY in `set_idle_state` (called at most
+once from `open_safe`, and only when an override is requested). Enforced by
+`selftest` (AST scan per function).
 """
 import argparse
 import ast
@@ -36,12 +38,14 @@ import time
 # `selftest` enforces this confinement via an AST scan per function.
 
 
-def open_safe(port, baud=None, raw=False, dtr_high=True, rts_high=True):
+def open_safe(port, baud=None, raw=False, dtr_high=None, rts_high=None):
     """Take over `port`. Returns an fd.
 
-    Equals picocom --noinit (no modem-line dance beyond the idle-safe set)
-    + --noreset (HUPCL=0). DTR/RTS are set to the idle-safe state exactly
-    once, AFTER tcsetattr (which can reset them on some drivers).
+    Equals picocom --noinit (no modem-line dance) + --noreset (HUPCL=0).
+    By DEFAULT no modem-control ioctl is issued at all (dtr_high/rts_high are
+    None). If an idle level is requested via --idle-dtr/--idle-rts, it is
+    applied exactly once, AFTER tcsetattr (which can reset the lines on some
+    drivers), mirroring how picocom calls set_dtr_rts() after term_apply.
     """
     flags = os.O_RDWR | getattr(os, "O_NOCTTY", 0) | os.O_NONBLOCK
     fd = os.open(port, flags)
@@ -74,35 +78,45 @@ def open_safe(port, baud=None, raw=False, dtr_high=True, rts_high=True):
         bc = getattr(termios, f"B{baud}", None)
         if bc is None:
             raise ValueError(f"unsupported baud rate: {baud}")
-        termios.cfsetspeed(attrs, bc)
+        # Portable baud set: cfsetspeed is Linux-only. On macOS/BSD the
+        # ispeed/ospeed fields live at indices 4/5 of the tcgetattr list.
+        if hasattr(termios, "cfsetspeed"):
+            termios.cfsetspeed(attrs, bc)
+        else:
+            attrs[4] = bc
+            attrs[5] = bc
 
     # ONE tcsetattr: applies HUPCL-clear (+ optional baud/raw). On some
-    # drivers tcsetattr (term_apply) resets DTR/RTS, so we re-assert the
-    # idle-safe state immediately afterwards (picocom does the same).
+    # drivers tcsetattr (term_apply) resets DTR/RTS, so if an idle level was
+    # requested we re-assert it immediately afterwards (picocom does the same).
     termios.tcsetattr(fd, termios.TCSANOW, attrs)
     set_idle_state(fd, dtr_high=dtr_high, rts_high=rts_high)
     return fd
 
 
-def set_idle_state(fd, dtr_high=True, rts_high=True):
-    """Assert/clear DTR and RTS to the chosen idle-safe levels, exactly once
-    at take-over. Uses TIOCMBIS/TIOCMBIC so only DTR/RTS are affected and
-    other modem bits are left untouched.
-
-    Default (both high/asserted) is the safe state for the common
-    low-active reset circuit (e.g. ESP32: EN/IO0 pulled up, high = released).
-    Pass high/low via --idle-dtr / --idle-rts for non-standard polarities.
+def set_idle_state(fd, dtr_high=None, rts_high=None):
+    """Optionally assert/clear DTR and RTS to a chosen idle state, at most once
+    at take-over. Passing None for either line leaves it untouched (the default
+    — the tool then never issues any modem-control ioctl, fully honoring the
+    "never touch flow control" guarantee). Use --idle-dtr/--idle-rts only when
+    your board's reset circuit requires a specific idle level (e.g. some
+    ESP32-S3 native-USB firmware resets unless RTS is deasserted). When used,
+    TIOCMBIS/TIOCMBIC touch only DTR/RTS, leaving other modem bits alone.
     """
+    if dtr_high is None and rts_high is None:
+        return
     set_bits = 0
     clr_bits = 0
-    if dtr_high:
-        set_bits |= termios.TIOCM_DTR
-    else:
-        clr_bits |= termios.TIOCM_DTR
-    if rts_high:
-        set_bits |= termios.TIOCM_RTS
-    else:
-        clr_bits |= termios.TIOCM_RTS
+    if dtr_high is not None:
+        if dtr_high:
+            set_bits |= termios.TIOCM_DTR
+        else:
+            clr_bits |= termios.TIOCM_DTR
+    if rts_high is not None:
+        if rts_high:
+            set_bits |= termios.TIOCM_RTS
+        else:
+            clr_bits |= termios.TIOCM_RTS
     if set_bits:
         try:
             fcntl.ioctl(fd, termios.TIOCMBIS, struct.pack("I", set_bits))
@@ -181,7 +195,7 @@ def recv_until(fd, pattern, timeout=5.0, n=4096):
             return bytes(buf)
 
 
-def console(port, baud=None, raw=True, dtr_high=True, rts_high=True):
+def console(port, baud=None, raw=True, dtr_high=None, rts_high=None):
     """Interactive console for a human. Attach = take over; Ctrl-] = release."""
     import tty
     fd = open_safe(port, baud=baud, raw=raw, dtr_high=dtr_high, rts_high=rts_high)
@@ -306,12 +320,14 @@ def build_parser():
                    help="set baud rate (optional; default = inherit driver setting)")
     p.add_argument("-r", "--raw", action="store_true",
                    help="apply raw mode at take-over (single tcsetattr, no modem touch)")
-    p.add_argument("--idle-dtr", choices=["high", "low"], default="high",
-                   help="DTR idle level at take-over (default high = safe for "
-                        "low-active reset circuits)")
-    p.add_argument("--idle-rts", choices=["high", "low"], default="high",
-                   help="RTS idle level at take-over (default high = safe for "
-                        "low-active reset circuits)")
+    p.add_argument("--idle-dtr", choices=["high", "low"], default=None,
+                   help="DTR level at take-over (optional; default = do NOT "
+                        "touch DTR). Set only if your board needs a specific "
+                        "idle level to avoid reset.")
+    p.add_argument("--idle-rts", choices=["high", "low"], default=None,
+                   help="RTS level at take-over (optional; default = do NOT "
+                        "touch RTS). Set only if your board needs a specific "
+                        "idle level to avoid reset.")
     sub = p.add_subparsers(dest="cmd")
     sub.add_parser("send").add_argument("data")
     ru = sub.add_parser("recv-until")
@@ -328,8 +344,8 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
 
-    idle_dtr = args.idle_dtr == "high"
-    idle_rts = args.idle_rts == "high"
+    idle_dtr = {"high": True, "low": False}.get(args.idle_dtr)
+    idle_rts = {"high": True, "low": False}.get(args.idle_rts)
 
     if args.cmd == "selftest":
         return selftest()
