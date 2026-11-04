@@ -1,0 +1,3 @@
+[submodule "picocom"]
+	path = picocom
+	url = https://github.com/npat-efault/picocom.git

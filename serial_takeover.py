@@ -1,42 +1,47 @@
 #!/usr/bin/env python3
-"""serial_takeover.py — minimal on-demand serial take-over that never touches
-flow control (DTR/RTS), so it never resets the MCU.
+"""serial_takeover.py — minimal on-demand serial take-over that never resets
+the MCU on take-over/release.
 
 Design (see REQUIREMENTS.md):
   * Based on picocom's --noinit / --noreset termios+ioctl mechanism.
   * NOT based on pyserial (pyserial re-opens and flips modem lines -> reset).
-  * No daemon, no socket, no modem-line control, no flash, no remote.
+  * No daemon, no socket, no flash, no remote, no deliberate modem control.
   * Each CLI invocation is a self-contained take-over -> act -> release cycle.
 
-The single unavoidable flow-control event is the kernel driver asserting
-DTR/RTS on open(); that is a hardware/OS fact, not something this tool does.
-Everything this tool does at take-over/release is limited to:
-  open(O_RDWR|O_NOCTTY|O_NONBLOCK) -> ioctl(TIOCEXCL) -> one tcsetattr that
-  ONLY clears HUPCL (so close() will not drop DTR/RTS) [+ optional baud/raw],
-  then close() (HUPCL=0 => no line drop).
+The one unavoidable flow-control event is the kernel driver asserting DTR/RTS
+on open(); that is a hardware/OS fact, not something this tool does. On
+take-over we additionally set DTR/RTS exactly ONCE to the idle-safe state
+(default: both asserted/high, which for the common low-active reset circuit
+= released = safe), mirroring how picocom calls set_dtr_rts() after tcsetattr
+(term_apply can reset the lines on some drivers). This happens only at open();
+release (close) and every send/recv never touch the modem lines.
 
-Static guarantee: this module contains NO TIOCM* ioctl, i.e. it never writes
-DTR/RTS. Enforced by `selftest`.
+Static guarantee: TIOCM* ioctls appear ONLY in `set_idle_state` (called once
+from `open_safe`). Enforced by `selftest` (AST scan per function).
 """
 import argparse
 import ast
+import errno
 import fcntl
 import os
 import select
+import struct
 import sys
 import termios
 import threading
 import time
 
-# Any TIOCM* termios constant means modem-line control. We must never use one.
-# `selftest` fails if such an identifier appears in the code (AST scan, so
-# docstrings/comments are ignored).
+# TIOCM* constants mean modem-line control. They are permitted ONLY inside
+# `set_idle_state` (called exactly once from `open_safe` at take-over).
+# `selftest` enforces this confinement via an AST scan per function.
 
 
-def open_safe(port, baud=None, raw=False):
-    """Take over `port` WITHOUT touching DTR/RTS. Returns an fd.
+def open_safe(port, baud=None, raw=False, dtr_high=True, rts_high=True):
+    """Take over `port`. Returns an fd.
 
-    Equals picocom --noinit (no modem-line dance) + --noreset (HUPCL=0).
+    Equals picocom --noinit (no modem-line dance beyond the idle-safe set)
+    + --noreset (HUPCL=0). DTR/RTS are set to the idle-safe state exactly
+    once, AFTER tcsetattr (which can reset them on some drivers).
     """
     flags = os.O_RDWR | getattr(os, "O_NOCTTY", 0) | os.O_NONBLOCK
     fd = os.open(port, flags)
@@ -71,10 +76,53 @@ def open_safe(port, baud=None, raw=False):
             raise ValueError(f"unsupported baud rate: {baud}")
         termios.cfsetspeed(attrs, bc)
 
-    # ONE tcsetattr: applies HUPCL-clear (+ optional baud/raw). It does NOT
-    # touch the DTR/RTS bits — they remain exactly as the driver left them.
+    # ONE tcsetattr: applies HUPCL-clear (+ optional baud/raw). On some
+    # drivers tcsetattr (term_apply) resets DTR/RTS, so we re-assert the
+    # idle-safe state immediately afterwards (picocom does the same).
     termios.tcsetattr(fd, termios.TCSANOW, attrs)
+    set_idle_state(fd, dtr_high=dtr_high, rts_high=rts_high)
     return fd
+
+
+def set_idle_state(fd, dtr_high=True, rts_high=True):
+    """Assert/clear DTR and RTS to the chosen idle-safe levels, exactly once
+    at take-over. Uses TIOCMBIS/TIOCMBIC so only DTR/RTS are affected and
+    other modem bits are left untouched.
+
+    Default (both high/asserted) is the safe state for the common
+    low-active reset circuit (e.g. ESP32: EN/IO0 pulled up, high = released).
+    Pass high/low via --idle-dtr / --idle-rts for non-standard polarities.
+    """
+    set_bits = 0
+    clr_bits = 0
+    if dtr_high:
+        set_bits |= termios.TIOCM_DTR
+    else:
+        clr_bits |= termios.TIOCM_DTR
+    if rts_high:
+        set_bits |= termios.TIOCM_RTS
+    else:
+        clr_bits |= termios.TIOCM_RTS
+    if set_bits:
+        try:
+            fcntl.ioctl(fd, termios.TIOCMBIS, struct.pack("I", set_bits))
+        except OSError as e:
+            if e.errno in (errno.ENOTTY, errno.EOPNOTSUPP, errno.EINVAL):
+                sys.stderr.write("warn: modem-control ioctl unsupported on this "
+                                 "device; idle-safe state skipped "
+                                 "(expected for pty/virtual ports)\n")
+            else:
+                raise
+    if clr_bits:
+        try:
+            fcntl.ioctl(fd, termios.TIOCMBIC, struct.pack("I", clr_bits))
+        except OSError as e:
+            if e.errno in (errno.ENOTTY, errno.EOPNOTSUPP, errno.EINVAL):
+                sys.stderr.write("warn: modem-control ioctl unsupported on this "
+                                 "device; idle-safe state skipped "
+                                 "(expected for pty/virtual ports)\n")
+            else:
+                raise
 
 
 def close_safe(fd):
@@ -133,10 +181,10 @@ def recv_until(fd, pattern, timeout=5.0, n=4096):
             return bytes(buf)
 
 
-def console(port, baud=None, raw=True):
+def console(port, baud=None, raw=True, dtr_high=True, rts_high=True):
     """Interactive console for a human. Attach = take over; Ctrl-] = release."""
     import tty
-    fd = open_safe(port, baud=baud, raw=raw)
+    fd = open_safe(port, baud=baud, raw=raw, dtr_high=dtr_high, rts_high=rts_high)
     try:
         stdin_fd = sys.stdin.fileno()
         old = termios.tcgetattr(stdin_fd)
@@ -189,19 +237,44 @@ def console(port, baud=None, raw=True):
 
 def selftest():
     """Phase 0 verification, no real device needed."""
-    import inspect
-    src = inspect.getsource(sys.modules[__name__])
+    src = open(__file__, "r", encoding="utf-8").read()
     tree = ast.parse(src)
-    for node in ast.walk(tree):
-        name = None
-        if isinstance(node, ast.Attribute):
-            name = node.attr
-        elif isinstance(node, ast.Name):
-            name = node.id
-        if name and name.startswith("TIOCM"):
-            print(f"FAIL: forbidden modem-control identifier {name!r} in code")
-            return 1
-    print("OK: static scan — no TIOCM* (no modem-line control) identifier in code")
+
+    ALLOWED = {"open_safe", "set_idle_state"}   # the one sanctioned place
+    FORBIDDEN = {"close_safe", "send", "recv", "recv_until", "console",
+                 "status", "main", "selftest", "build_parser",
+                 "_readable", "_writable"}
+
+    def idents_in(fn):
+        s = set()
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Attribute):
+                s.add(n.attr)
+            elif isinstance(n, ast.Name):
+                s.add(n.id)
+        return s
+
+    violations = []
+    has_sanctioned = False
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        toks = {i for i in idents_in(node) if "TIOCM" in i}
+        if node.name in ALLOWED and toks:
+            has_sanctioned = True
+        if toks and node.name not in ALLOWED:
+            violations.append((node.name, sorted(toks)))
+
+    if not has_sanctioned:
+        print("FAIL: no sanctioned TIOCM usage in open_safe/set_idle_state")
+        return 1
+    if violations:
+        for fn, toks in violations:
+            print(f"FAIL: modem-control {toks} in {fn!r} "
+                  f"(must live only in open_safe/set_idle_state)")
+        return 1
+    print("OK: static scan — TIOCM* confined to set_idle_state (one-time "
+          "idle-safe set at take-over); no other function touches modem lines")
 
     # Dynamic pty loopback: proves the byte path + open/close run cleanly.
     try:
@@ -227,12 +300,18 @@ def selftest():
 def build_parser():
     p = argparse.ArgumentParser(
         prog="serial_takeover.py",
-        description="On-demand serial take-over without touching flow control.")
+        description="On-demand serial take-over without resetting the MCU.")
     p.add_argument("-p", "--port", help="serial port (e.g. /dev/cu.usbserial-*)")
     p.add_argument("-b", "--baud", type=int, default=None,
                    help="set baud rate (optional; default = inherit driver setting)")
     p.add_argument("-r", "--raw", action="store_true",
                    help="apply raw mode at take-over (single tcsetattr, no modem touch)")
+    p.add_argument("--idle-dtr", choices=["high", "low"], default="high",
+                   help="DTR idle level at take-over (default high = safe for "
+                        "low-active reset circuits)")
+    p.add_argument("--idle-rts", choices=["high", "low"], default="high",
+                   help="RTS idle level at take-over (default high = safe for "
+                        "low-active reset circuits)")
     sub = p.add_subparsers(dest="cmd")
     sub.add_parser("send").add_argument("data")
     ru = sub.add_parser("recv-until")
@@ -249,6 +328,9 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
 
+    idle_dtr = args.idle_dtr == "high"
+    idle_rts = args.idle_rts == "high"
+
     if args.cmd == "selftest":
         return selftest()
 
@@ -260,7 +342,7 @@ def main(argv=None):
         return 2
 
     if args.cmd == "send":
-        fd = open_safe(args.port, args.baud, args.raw)
+        fd = open_safe(args.port, args.baud, args.raw, idle_dtr, idle_rts)
         try:
             send(fd, args.data)
         finally:
@@ -268,7 +350,7 @@ def main(argv=None):
         return 0
 
     if args.cmd == "recv":
-        fd = open_safe(args.port, args.baud, args.raw)
+        fd = open_safe(args.port, args.baud, args.raw, idle_dtr, idle_rts)
         try:
             data = recv(fd, args.timeout)
             sys.stdout.buffer.write(data)
@@ -278,7 +360,7 @@ def main(argv=None):
         return 0
 
     if args.cmd == "recv-until":
-        fd = open_safe(args.port, args.baud, args.raw)
+        fd = open_safe(args.port, args.baud, args.raw, idle_dtr, idle_rts)
         try:
             data = recv_until(fd, args.pattern, args.timeout)
             sys.stdout.buffer.write(data)
@@ -288,12 +370,14 @@ def main(argv=None):
         return 0
 
     if args.cmd == "status":
-        print(f"port={args.port} baud={args.baud} raw={args.raw}")
-        print("note: this tool never reads or writes DTR/RTS (no modem control).")
+        print(f"port={args.port} baud={args.baud} raw={args.raw} "
+              f"idle_dtr={args.idle_dtr} idle_rts={args.idle_rts}")
+        print("note: DTR/RTS are set to the idle-safe level exactly once at "
+              "take-over; release and all I/O never touch the modem lines.")
         return 0
 
     if args.cmd == "console":
-        console(args.port, args.baud, args.raw)
+        console(args.port, args.baud, args.raw, idle_dtr, idle_rts)
         return 0
 
     sys.stderr.write(f"error: unknown command {args.cmd}\n")
