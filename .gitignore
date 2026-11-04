@@ -1,0 +1,13 @@
+# build artifacts
+*.o
+*.a
+gateway/uart-gateway
+client/__pycache__/
+__pycache__/
+*.pyc
+
+# logs
+*.log
+
+# local socket (runtime, not source)
+*.sock
