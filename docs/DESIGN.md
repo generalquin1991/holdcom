@@ -2,12 +2,12 @@
 
 ## 1. Problem (root cause, verified against picocom source)
 
-ESP32's auto-reset / auto-boot circuit wires the USB-UART bridge's
-**RTS → EN (reset, active-low)** and **DTR → IO0 (boot select, active-low)**
-through transistors. On Linux/macOS, `open()` of a USB-UART port makes the
-kernel driver (`ftdi_sio` etc.) call `ftdi_dtr_rts(on=1)` → it **asserts
-TIOCM_DTR/RTS** (`picocom-src/lowerrts.md:84-87`). That pulse resets / boots
-the chip.
+A target MCU's auto-reset / auto-boot circuit (e.g. ESP32) wires the USB-UART
+bridge's **RTS → EN (reset, active-low)** and **DTR → IO0 (boot select,
+active-low)** through transistors. On Linux/macOS, `open()` of a USB-UART port
+makes the kernel driver (`ftdi_sio` etc.) call `ftdi_dtr_rts(on=1)` → it
+**asserts TIOCM_DTR/RTS** (`picocom-src/lowerrts.md:84-87`). That pulse resets /
+boots the chip.
 
 picocom documents this and can only *mitigate* it: `--lower-rts` lowers RTS
 ASAP after open (still a 50–450 µs pulse, OS may preempt between open and
@@ -16,8 +16,8 @@ lower), and `--noreset` clears `HUPCL` so close does not drop DTR
 `term_set(..., local=1, hup_close=!noreset)`, `term_raise/lower_dtr/rts`
 (ioctl `TIOCMBIS/TIOCMBIC`), `term_get_mctl` (ioctl `TIOCMGET`).
 
-**pyserial triggers the pulse on *every* `open()`** → each AI interaction
-reboots the ESP32. That is the exact pain point.
+**pyserial triggers the pulse on *every* `open()`** → each interaction reboots
+the MCU. That is the exact pain point.
 
 ## 2. Solution: long-lived exclusive gateway
 
@@ -31,24 +31,25 @@ reboots the ESP32. That is the exact pain point.
         ▼
  USB-UART bridge  (RTS→EN, DTR→IO0, active-low)
         ▼
-      ESP32
+      target MCU
 ```
 
 AI never opens the serial port. The gateway opens it **once**, holds it
-**exclusively**, and exposes a socket API.
+**exclusively**, and exposes a socket API. **Occupy = connect, release =
+disconnect** — neither opens/closes the port, so neither affects DTR/RTS.
 
 ## 3. Guarantees (how the reset is *fully* eliminated)
 
 | # | Mechanism | Effect |
 |---|----------|--------|
-| 1 | Port `open()`ed once at startup; all AI access via socket | zero operational opens → zero operational resets |
-| 2 | `ioctl(TIOCEXCL)` + `flock(LOCK_EX)` | pyserial (or anything) **cannot** open the port while gateway holds it |
-| 3 | `HUPCL=0` (`local=1, hup_close=0`) | gateway exit does not drop DTR → no exit reset |
-| 4 | DTR/RTS held in safe run state (ESP32: DTR=1,RTS=1) | no accidental trigger; only explicit `RESET`/`BOOT` moves them |
-| 5 | On USB replug, gateway re-opens and re-asserts safe state | recovery stays exclusive; outside processes cannot interleave |
+| 1 | Port `open()`ed once at startup; all access via socket | zero operational opens → zero operational resets |
+| 2 | `ioctl(TIOCEXCL)` + `flock(LOCK_EX)` | nothing else can open the port |
+| 3 | `HUPCL=0` | gateway release/exit does not drop DTR → no reset on release |
+| 4 | DTR/RTS held in safe state; client connect/disconnect never moves them | no accidental trigger |
+| 5 | On USB replug, gateway re-opens and re-asserts safe state | recovery stays exclusive |
 
-The only unavoidable pulse is the single `open()` at gateway launch
-(kernel-driven, see §1). It is a one-time, user-controlled event.
+The only unavoidable pulse is the single `open()` at gateway launch (kernel-
+driven, see §1). It is a one-time, user-controlled event.
 
 ## 4. Implementation plan (modules)
 
@@ -60,60 +61,30 @@ The only unavoidable pulse is the single `open()` at gateway launch
 - `gateway/main.c` — arg parsing, glue.
 - `client/uart_client.py` — pure-socket client (no pyserial).
 - `client/cli.py` — CLI wrapper.
-- `docs/INTERFACE.md` — frozen interface contract (wire + C API + Python API + CLI + config).
+- `docs/INTERFACE.md` — frozen interface contract (wire + C API + Python API +
+  CLI + config).
 - `docs/PROTOCOL.md` — wire-protocol deep-dive (mirrors `INTERFACE.md` §1).
 
 ## 5. License decision (picocom is GPL-2.0)
 
 picocom (`picocom-src/LICENSE.txt`) is **GPL-2.0**. We therefore:
 
-- **Do NOT copy/link picocom code** into this repo. `serial.c` is a
-  clean-room reimplementation using only the *approach* documented in
-  picocom's `term.c` / `lowerrts.md` as reference. This keeps our gateway
-  code license-clean.
+- **Do NOT copy/link picocom code** into this repo. `serial.c` is a clean-room
+  reimplementation using only the *approach* documented in picocom's `term.c` /
+  `lowerrts.md` as reference.
 - Keep `picocom-src` as a **read-only reference submodule**, pinned to a tag
-  (e.g. `v3.1`) rather than floating `main`, for reproducibility.
-- **No fork needed.** Because we never consume picocom's code, its upstream
-  evolution has zero impact on our build/behaviour. To refresh the reference:
-  `git submodule update --remote picocom-src`. A fork is warranted only if we
-  intend to upstream a patch to picocom itself (fork → branch → PR), or if we
-  abandoned clean-room and vendored a *modified* picocom — the latter would
-  reintroduce GPL, which we explicitly avoid.
+  (e.g. `v3.1`) rather than floating `main`.
+- **No fork needed.** We never consume picocom's code, so its upstream evolution
+  has zero impact. To refresh: `git submodule update --remote picocom-src`. A
+  fork is warranted only to upstream a patch to picocom itself, or if we
+  abandoned clean-room and vendored a *modified* picocom (would reintroduce
+  GPL — explicitly avoided).
 
-## 6. Flash / yield mode (pty proxy) — design gap, now closed
+## 6. Status
 
-A native flashing tool (e.g. `esptool`) must `open()` the port itself and toggle
-DTR/RTS for the reset/boot sequence. But our invariant holds the real port
-exclusively (`TIOCEXCL`), so the tool cannot open it — and even if we released
-it, `open()` would itself emit the reset pulse. **Releasing the port is not a
-solution.**
-
-Design: the gateway **keeps** the real port and instead creates a **pty** for the
-tool to use.
-
-1. Client sends `FLASH_BEGIN`.
-2. Gateway calls `posix_openpt` + `grantpt` + `unlockpt` to make a pty pair,
-   starts a transparent bridge loop (**before** replying), then replies
-   `FLASH_READY <slave_path>` (macOS `/dev/ttysNNN`, Linux `/dev/pts/N`).
-3. Client launches the tool with `--port <slave_path>`. The tool `open()`s the
-   **pty**, not the real device → no open-time pulse on hardware.
-4. Bridge forwards bytes pty-master ↔ real serial fd and **mirrors modem
-   ioctls** (`TIOCMGET/SET` on pty master → `TIOCMSET` on real port), so the
-   tool's DTR/RTS reset sequence reaches the device faithfully.
-5. Tool exits → client `FLASH_END` (or pty EOF). Gateway stops bridge, re-asserts
-   safe DTR/RTS, closes pty, returns to normal mode.
-
-Why this is correct: the real port is still `open()`ed exactly once; `TIOCEXCL`
-is held throughout, so even the flashing tool cannot touch it directly. The tool
-gets its intentional reset via the ioctl mirror; `HUPCL` on the real port stays
-`0` regardless of what the tool sets on the pty, so tool exit does not drop DTR.
-(An alternative — passing the real fd via `SCM_RIGHTS` — was rejected: the tool
-would not know to return it, and `TIOCEXCL`/safe-state invariants would break.)
-
-## 7. Status
-
-Skeleton only. Directory layout, Makefile, headers, protocol/design docs, and
-stub functions are in place. **Core logic (serial termios/ioctl, socket event
-loop, protocol parser, client implementation) is NOT yet written.** Real-device
-testing deferred until explicitly permitted. The interface contract is frozen in
-[`INTERFACE.md`](./INTERFACE.md).
+Skeleton only. Directory layout, Makefile, headers, interface/design docs are in
+place. **Core logic (serial termios/ioctl, socket event loop, protocol parser,
+client implementation) is NOT yet written.** Real-device testing deferred until
+explicitly permitted. The interface contract is frozen in
+[`INTERFACE.md`](./INTERFACE.md) (minimal scope — flash / deliberate modem
+commands removed as out of scope).

@@ -6,8 +6,6 @@ Planned usage:
     python3 cli.py send "AT\\r\\n"
     python3 cli.py recv 2000
     python3 cli.py recv_until OK 5000
-    python3 cli.py reset
-    python3 cli.py boot
     python3 cli.py status
 """
 import argparse
@@ -24,8 +22,6 @@ def main():
     sub.add_parser("recv").add_argument("timeout_ms", type=int)
     ru = sub.add_parser("recv_until")
     ru.add_argument("pattern"); ru.add_argument("timeout_ms", type=int)
-    sub.add_parser("reset")
-    sub.add_parser("boot")
     sub.add_parser("status")
 
     args = p.parse_args()

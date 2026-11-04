@@ -7,15 +7,12 @@ the gateway daemon, which is the whole point of this project.
 
 Intended API (to be implemented):
     c = UartClient(sock_path="/tmp/uart-gateway.sock")
-    c.connect()
+    c.connect()           # occupy entry point
     c.send("AT\\r\\n")
     line = c.recv_line(timeout=2.0)
     c.recv_until("OK", timeout=5.0)
-    c.set_dtr(1); c.set_rts(1)
-    c.reset()          # toggle EN
-    c.boot()           # enter download mode
     c.status()
-    c.close()
+    c.close()             # release entry point
 """
 import socket
 import time
@@ -40,18 +37,6 @@ class UartClient:
 
     def recv_until(self, pattern: str, timeout=None):
         raise NotImplementedError("uart_client.recv_until: skeleton not implemented")
-
-    def set_dtr(self, level: int):
-        raise NotImplementedError("uart_client.set_dtr: skeleton not implemented")
-
-    def set_rts(self, level: int):
-        raise NotImplementedError("uart_client.set_rts: skeleton not implemented")
-
-    def reset(self):
-        raise NotImplementedError("uart_client.reset: skeleton not implemented")
-
-    def boot(self):
-        raise NotImplementedError("uart_client.boot: skeleton not implemented")
 
     def status(self):
         raise NotImplementedError("uart_client.status: skeleton not implemented")

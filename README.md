@@ -1,15 +1,15 @@
 # ai-serial-gateway
 
 A long-lived, **exclusive** serial-port gateway so that AI / scripts can talk
-to an ESP32 (or any UART device) **without rebooting it**.
+to a UART device **without rebooting it on every connect**.
 
 ## Why this exists
 
 `pyserial` calls `open()` on the USB-UART port for every session. On
 Linux/macOS that makes the kernel driver assert `DTR`/`RTS`, which — through
-ESP32's auto-reset circuit (RTS→EN, DTR→IO0, active-low) — **resets the
-chip on every connect**. This project removes the serial port from the
-AI critical path entirely.
+a target MCU's auto-reset circuit (e.g. RTS→EN, DTR→IO0, active-low) —
+**resets the chip on every connect**. This project removes the serial port from
+the AI critical path entirely.
 
 ## How it works
 
@@ -19,13 +19,24 @@ AI critical path entirely.
                                                   │ TIOCEXCL + flock (exclusive)
                                                   │ HUPCL=0, DTR/RTS = safe run state
                                                   ▼
-                                            USB-UART bridge ──► ESP32
+                                            USB-UART bridge ──► target MCU
 ```
 
 The gateway opens the port **once**, holds it **exclusively**
 (`TIOCEXCL` + `flock`), and never drops `DTR` on exit (`HUPCL=0`). AI tools
 connect over a local Unix socket and never touch the port.
-See `docs/DESIGN.md` and `docs/PROTOCOL.md`.
+
+**Occupy = connect, release = disconnect** — neither opens/closes the port, so
+neither affects DTR/RTS and neither resets the MCU.
+
+See `docs/DESIGN.md`, `docs/PROTOCOL.md`, and the frozen `docs/INTERFACE.md`.
+
+## Scope (frozen)
+
+Minimal, explicit scope: a reliable entry point whose occupy/release never
+affects DTR/RTS. Flash / yield (pty proxy) mode and deliberate modem-write
+commands (`SET_DTR`/`SET_RTS`/`RESET`/`BOOT`) are **out of scope** unless
+explicitly requested.
 
 ## Status: SKELETON
 
@@ -46,5 +57,5 @@ ai-serial-gateway/
 ├── picocom-src/          # reference submodule (GPL-2.0, NOT copied)
 ├── gateway/              # C daemon (serial.c / server.c / main.c / Makefile)
 ├── client/               # Python pure-socket client + CLI (no pyserial)
-└── docs/                 # DESIGN.md, PROTOCOL.md
+└── docs/                 # DESIGN.md, PROTOCOL.md, INTERFACE.md
 ```

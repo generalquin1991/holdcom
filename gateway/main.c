@@ -1,10 +1,10 @@
 /*
  * main.c - uart-gateway entry point (skeleton, arg parsing only)
  *
- * Usage (planned):
+ * Usage (frozen config, see docs/INTERFACE.md §5):
  *   uart-gateway -p <port> -b <baud> [-s <unix-socket>]
- *                [-d <databits>] [-S <stopbits>] [-P <parity>]
- *                [--flow] [--dtr <0|1>] [--rts <0|1>]
+ *                [-P <dtr_polarity>] [-R <rts_polarity>]
+ *                [--send-crlf] [--daemon]
  */
 #include "serial.h"
 #include "server.h"
@@ -18,40 +18,39 @@ static void usage(const char *p)
     fprintf(stderr,
         "uart-gateway (SKELETON - logic not implemented)\n"
         "usage: %s -p <port> -b <baud> [-s <unix-socket>]\n"
-        "          [-d <databits>] [-S <stopbits>] [-P <parity>] [--flow]\n"
-        "          [--dtr <0|1>] [--rts <0|1>]\n", p);
+        "          [-P <dtr_polarity>] [-R <rts_polarity>]\n"
+        "          [--send-crlf] [--daemon]\n", p);
 }
 
 int main(int argc, char **argv)
 {
     const char *port = NULL;
     const char *sock_path = "/tmp/uart-gateway.sock";
-    int  baud = 115200;
-    int  databits = 8, stopbits = 1, parity = 0;
-    int  dtr = 1, rts = 1;       /* ESP32 safe "run" state default */
-    int  flow = 0;
+    int  baud     = 115200;
+    int  dtr_pol  = 0;     /* 0 = low-active (safe = high), 1 = high-active */
+    int  rts_pol  = 0;
+    int  send_crlf = 0;
+    int  daemonize = 0;
     int  opt;
 
-    while ((opt = getopt(argc, argv, "p:b:s:d:S:P:h")) != -1) {
+    while ((opt = getopt(argc, argv, "p:b:s:P:R:h")) != -1) {
         switch (opt) {
         case 'p': port = optarg; break;
         case 'b': baud = atoi(optarg); break;
         case 's': sock_path = optarg; break;
-        case 'd': databits = atoi(optarg); break;
-        case 'S': stopbits = atoi(optarg); break;
-        case 'P': parity = atoi(optarg); break;
+        case 'P': dtr_pol = atoi(optarg); break;
+        case 'R': rts_pol = atoi(optarg); break;
         case 'h': usage(argv[0]); return 0;
         default:  usage(argv[0]); return 1;
         }
     }
-    /* --flow / --dtr / --rts handled via getopt_long in real impl */
-    (void)flow; (void)dtr; (void)rts;
+    /* --send-crlf / --daemon handled via getopt_long in real impl */
+    (void)send_crlf; (void)daemonize;
 
     if (!port) { usage(argv[0]); return 1; }
 
-    printf("[skeleton] port=%s baud=%d sock=%s db=%d sb=%d par=%d\n",
-           port, baud, sock_path ? sock_path : "(none)",
-           databits, stopbits, parity);
+    printf("[skeleton] port=%s baud=%d sock=%s dtr_pol=%d rts_pol=%d\n",
+           port, baud, sock_path ? sock_path : "(none)", dtr_pol, rts_pol);
 
     serial_t ser = {0};
     server_cfg_t cfg = { .ser = &ser, .sock_path = (char*)sock_path };
