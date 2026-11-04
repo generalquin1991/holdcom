@@ -11,3 +11,6 @@ __pycache__/
 
 # local socket (runtime, not source)
 *.sock
+
+# compiler temp objects
+*.o.tmp

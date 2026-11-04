@@ -60,7 +60,8 @@ The only unavoidable pulse is the single `open()` at gateway launch
 - `gateway/main.c` — arg parsing, glue.
 - `client/uart_client.py` — pure-socket client (no pyserial).
 - `client/cli.py` — CLI wrapper.
-- `docs/PROTOCOL.md` — line protocol spec.
+- `docs/INTERFACE.md` — frozen interface contract (wire + C API + Python API + CLI + config).
+- `docs/PROTOCOL.md` — wire-protocol deep-dive (mirrors `INTERFACE.md` §1).
 
 ## 5. License decision (picocom is GPL-2.0)
 
@@ -79,9 +80,40 @@ picocom (`picocom-src/LICENSE.txt`) is **GPL-2.0**. We therefore:
   abandoned clean-room and vendored a *modified* picocom — the latter would
   reintroduce GPL, which we explicitly avoid.
 
-## 6. Status
+## 6. Flash / yield mode (pty proxy) — design gap, now closed
+
+A native flashing tool (e.g. `esptool`) must `open()` the port itself and toggle
+DTR/RTS for the reset/boot sequence. But our invariant holds the real port
+exclusively (`TIOCEXCL`), so the tool cannot open it — and even if we released
+it, `open()` would itself emit the reset pulse. **Releasing the port is not a
+solution.**
+
+Design: the gateway **keeps** the real port and instead creates a **pty** for the
+tool to use.
+
+1. Client sends `FLASH_BEGIN`.
+2. Gateway calls `posix_openpt` + `grantpt` + `unlockpt` to make a pty pair,
+   starts a transparent bridge loop (**before** replying), then replies
+   `FLASH_READY <slave_path>` (macOS `/dev/ttysNNN`, Linux `/dev/pts/N`).
+3. Client launches the tool with `--port <slave_path>`. The tool `open()`s the
+   **pty**, not the real device → no open-time pulse on hardware.
+4. Bridge forwards bytes pty-master ↔ real serial fd and **mirrors modem
+   ioctls** (`TIOCMGET/SET` on pty master → `TIOCMSET` on real port), so the
+   tool's DTR/RTS reset sequence reaches the device faithfully.
+5. Tool exits → client `FLASH_END` (or pty EOF). Gateway stops bridge, re-asserts
+   safe DTR/RTS, closes pty, returns to normal mode.
+
+Why this is correct: the real port is still `open()`ed exactly once; `TIOCEXCL`
+is held throughout, so even the flashing tool cannot touch it directly. The tool
+gets its intentional reset via the ioctl mirror; `HUPCL` on the real port stays
+`0` regardless of what the tool sets on the pty, so tool exit does not drop DTR.
+(An alternative — passing the real fd via `SCM_RIGHTS` — was rejected: the tool
+would not know to return it, and `TIOCEXCL`/safe-state invariants would break.)
+
+## 7. Status
 
 Skeleton only. Directory layout, Makefile, headers, protocol/design docs, and
 stub functions are in place. **Core logic (serial termios/ioctl, socket event
 loop, protocol parser, client implementation) is NOT yet written.** Real-device
-testing deferred until explicitly permitted.
+testing deferred until explicitly permitted. The interface contract is frozen in
+[`INTERFACE.md`](./INTERFACE.md).
