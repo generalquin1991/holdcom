@@ -10,7 +10,7 @@
 #   brew install holdcom
 #
 # BEFORE PUBLISHING — replace the following:
-#   - <YOUR_GITHUB_USER> with your GitHub account
+#   - generalquin1991 with your GitHub account
 #   - the placeholder sha256 with the real digest of the raw file:
 #       curl -fsSL <url> | sha256sum
 #   - tag a release v0.1.0 so the URL resolves
@@ -18,11 +18,11 @@
 
 class Holdcom < Formula
   desc "On-demand serial take-over without resetting the MCU (picocom-like)"
-  homepage "https://github.com/<YOUR_GITHUB_USER>/holdcom"
-  url "https://raw.githubusercontent.com/<YOUR_GITHUB_USER>/holdcom/v0.1.0/holdcom.py"
+  homepage "https://github.com/generalquin1991/holdcom"
+  url "https://raw.githubusercontent.com/generalquin1991/holdcom/v0.1.0/holdcom.py"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000" # TODO: replace
   version "0.1.0"
-  # license "MIT"  # TODO: choose a license and add LICENSE to the repo
+  license "MIT"
 
   depends_on "python@3.13"
 

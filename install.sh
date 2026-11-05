@@ -3,7 +3,7 @@
 # holdcom installer — single-file, pure-stdlib. No pip / no compilation needed.
 #
 # One-liner (after the repo is hosted on GitHub):
-#   curl -fsSL https://raw.githubusercontent.com/<YOUR_GITHUB_USER>/holdcom/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/generalquin1991/holdcom/main/install.sh | bash
 #
 # Or run locally from a checked-out repo:
 #   bash install.sh
@@ -15,8 +15,8 @@ set -euo pipefail
 
 INSTALL_NAME="holdcom"
 
-# Default source: GitHub raw. Replace <YOUR_GITHUB_USER> once the repo is pushed.
-DEFAULT_URL="https://raw.githubusercontent.com/<YOUR_GITHUB_USER>/holdcom/main/holdcom.py"
+# Default source: GitHub raw. Replace generalquin1991 once the repo is pushed.
+DEFAULT_URL="https://raw.githubusercontent.com/generalquin1991/holdcom/main/holdcom.py"
 HOLDCOM_URL="${HOLDCOM_URL:-$DEFAULT_URL}"
 
 # Choose an install dir: prefer /usr/local/bin if writable, else ~/bin.

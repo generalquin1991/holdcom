@@ -112,14 +112,14 @@
 - `curl -fsSL <RAW_URL>/install.sh | bash` 把单个 `holdcom.py` 下载到
   `bin/`（`/usr/local/bin` 可写则用之，否则 `~/bin`）并 `chmod +x`，无需 pip/编译。
 - 源 URL 通过环境变量 `HOLDCOM_URL` 覆盖；默认指向
-  `https://raw.githubusercontent.com/<YOUR_GITHUB_USER>/holdcom/main/holdcom.py`
-  —— **推到 GitHub 后把 `<YOUR_GITHUB_USER>` 换成你的账号**即生效。
+  `https://raw.githubusercontent.com/generalquin1991/holdcom/main/holdcom.py`
+  —— **推到 GitHub 后把 `generalquin1991` 换成你的账号**即生效。
 - 脚本含 shebang 校验 + 装完跑 `selftest` 自检。
 
 ### 通道 3：Homebrew formula（已写 `Formula/holdcom.rb`，可选）
 - 公式把 `holdcom.py` 装进 `bin/holdcom`（无编译，纯 stdlib；用 `write_exec_script`
   包一层 brewed python 解释器），依赖稳定源 URL。
-- 发布前需替换：`<YOUR_GITHUB_USER>`、真实 `sha256`、`v0.1.0` tag；并定 license + LICENSE 文件。
+- 发布前需替换：`generalquin1991`、真实 `sha256`、`v0.1.0` tag；并定 license + LICENSE 文件。
 - 本地免 tap 安装：`brew install --formula Formula/holdcom.rb`；
   正式分发需自建 tap（如 `yourname/homebrew-tap`）或提交上游。属增强项，非阻塞。
 
