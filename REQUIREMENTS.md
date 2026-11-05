@@ -95,18 +95,34 @@
   boot: 等）→ close_safe`；`selftest` 静态扫描仍通过（TIOCM 仅在 `set_idle_state`，
   默认 no-op）。
 
-## 发布（像 picocom 一样一行安装、裸命令调用）
-- 本工具是纯 Python（仅标准库），用 **PyPI + pip** 作为与 picocom 的
-  `brew install picocom` 对等的发布通道。发布定义见仓库根 `pyproject.toml`
-  （entry point `holdcom = holdcom:main`；安装后 PATH 里出现裸 `holdcom` 命令）。
-- 发布流程（在**有 setuptools + 网络**的机器上）：
-  1. `python -m build`              # 产出 dist/holdcom-*.whl 与 .tar.gz
-  2. `python -m twine upload dist/*` # 上传 PyPI
-  3. 他人：`pip install holdcom` → 裸 `holdcom` 命令（等价于 `brew install picocom`）
+## 发布（一行安装、裸命令调用，多通道并行）
+本工具是纯 Python（仅标准库、单文件 `holdcom.py`，带 `#!/usr/bin/env python3`），
+可走以下任一通道分发，互不影响：
+
+### 通道 1：PyPI + pip（Python 生态，定义已就绪）
+- 发布定义见仓库根 `pyproject.toml`（entry point `holdcom = holdcom:main`；
+  安装后 PATH 里出现裸 `holdcom` 命令；`argparse prog` 已设为 `holdcom`）。
+- 流程（在**有 setuptools + 网络**的机器上）：
+  1. `python -m build`                # 产出 dist/holdcom-*.whl 与 .tar.gz
+  2. `python -m twine upload dist/*`  # 上传 PyPI
+  3. 他人：`pip install holdcom` → 裸 `holdcom`
   4. 本地开发：`pip install .` / `pip install -e .` 也能得到裸命令。
+
+### 通道 2：bash 一键安装脚本（已就绪，`install.sh`）
+- `curl -fsSL <RAW_URL>/install.sh | bash` 把单个 `holdcom.py` 下载到
+  `bin/`（`/usr/local/bin` 可写则用之，否则 `~/bin`）并 `chmod +x`，无需 pip/编译。
+- 源 URL 通过环境变量 `HOLDCOM_URL` 覆盖；默认指向
+  `https://raw.githubusercontent.com/<YOUR_GITHUB_USER>/holdcom/main/holdcom.py`
+  —— **推到 GitHub 后把 `<YOUR_GITHUB_USER>` 换成你的账号**即生效。
+- 脚本含 shebang 校验 + 装完跑 `selftest` 自检。
+
+### 通道 3：Homebrew formula（可选，待写 `Formula/holdcom.rb`）
+- 公式只需把 `holdcom.py` 装进 `bin/holdcom`（无编译，纯 stdlib），依赖稳定源 URL。
+- 需自建 tap（如 `yourname/homebrew-tap`）或提交上游；属增强项，非阻塞。
+
+### 本机现状
 - **本机限制**（WorkBuddy 自带 python 3.13）：无 setuptools、无外网，
-  `pip install .` 无法进行。这是环境限制，不是发布定义的问题。
-  该机器上要立刻裸命令调用，可用软链兜底：
-  `ln -sf "$(pwd)/holdcom.py" ~/bin/holdcom`（`~/bin` 已在 PATH，脚本纯标准库）。
-- 可选增强（非必需）：再做一个 Homebrew formula（tap）让 macOS 用户也能
-  `brew install holdcom`，进一步对齐 picocom 的分发形态。
+  `pip install .` 无法进行；且沙箱禁止向 `~/bin` 写文件，软链兜底在此环境也失效。
+  这是环境限制，不是发布定义的问题。
+- 联网后可在本机直接 `pip install --user .`（装到 `~/Library/Python/*/bin`，
+  在 PATH 内）拿到真正的裸 `holdcom` 命令，同时端到端验证打包定义。

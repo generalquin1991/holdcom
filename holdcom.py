@@ -313,7 +313,7 @@ def selftest():
 
 def build_parser():
     p = argparse.ArgumentParser(
-        prog="holdcom.py",
+        prog="holdcom",
         description="On-demand serial take-over without resetting the MCU. No command given = interactive console.")
     p.add_argument("-p", "--port", help="serial port (e.g. /dev/cu.usbserial-*)")
     p.add_argument("-b", "--baud", type=int, default=None,
