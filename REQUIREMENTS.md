@@ -116,9 +116,12 @@
   —— **推到 GitHub 后把 `<YOUR_GITHUB_USER>` 换成你的账号**即生效。
 - 脚本含 shebang 校验 + 装完跑 `selftest` 自检。
 
-### 通道 3：Homebrew formula（可选，待写 `Formula/holdcom.rb`）
-- 公式只需把 `holdcom.py` 装进 `bin/holdcom`（无编译，纯 stdlib），依赖稳定源 URL。
-- 需自建 tap（如 `yourname/homebrew-tap`）或提交上游；属增强项，非阻塞。
+### 通道 3：Homebrew formula（已写 `Formula/holdcom.rb`，可选）
+- 公式把 `holdcom.py` 装进 `bin/holdcom`（无编译，纯 stdlib；用 `write_exec_script`
+  包一层 brewed python 解释器），依赖稳定源 URL。
+- 发布前需替换：`<YOUR_GITHUB_USER>`、真实 `sha256`、`v0.1.0` tag；并定 license + LICENSE 文件。
+- 本地免 tap 安装：`brew install --formula Formula/holdcom.rb`；
+  正式分发需自建 tap（如 `yourname/homebrew-tap`）或提交上游。属增强项，非阻塞。
 
 ### 本机现状
 - **本机限制**（WorkBuddy 自带 python 3.13）：无 setuptools、无外网，
