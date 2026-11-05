@@ -33,7 +33,7 @@ import termios
 import threading
 import time
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 # TIOCM* constants mean modem-line control. They are permitted ONLY inside
 # `set_idle_state` (called exactly once from `open_safe` at take-over).
@@ -322,10 +322,17 @@ def selftest():
     return 0
 
 
+# Known subcommands. A bare token that is NOT one of these is treated as the
+# serial device (picocom-style positional), so `holdcom /dev/ttyX` just works.
+SUBCOMMANDS = {"send", "recv", "recv-until", "status", "console", "selftest"}
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="holdcom",
-        description="On-demand serial take-over without resetting the MCU. No command given = interactive console.")
+        description="On-demand serial take-over without resetting the MCU. "
+                    "Pass the device as a positional (picocom-style) or via -p; "
+                    "no command given = interactive console.")
     p.add_argument("--version", action="version",
                    version=f"holdcom {__version__}")
     p.add_argument("-p", "--port", help="serial port (e.g. /dev/cu.usbserial-*)")
@@ -354,8 +361,45 @@ def build_parser():
     return p
 
 
+def _find_device(argv):
+    """Index of the first token that is a standalone (non-option, non-option-
+    value) positional, or None. Used to detect a picocom-style leading device
+    path while ignoring option values such as the argument of `-p`/`-b`."""
+    opts_with_val = {"-p", "--port", "-b", "--baud", "--idle-dtr", "--idle-rts"}
+    i, n = 0, len(argv)
+    while i < n:
+        a = argv[i]
+        if a.startswith("-"):
+            if a in opts_with_val and i + 1 < n:
+                i += 2
+                continue
+            i += 1
+            continue
+        return i
+    return None
+
+
 def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    argv = list(argv)
+
+    # picocom-style: if the first standalone (non-option) token is NOT a known
+    # subcommand, treat it as the serial device and rewrite it as `-p <device>`
+    # before parsing. This keeps `holdcom /dev/ttyX -b 2000000` working exactly
+    # like `picocom /dev/ttyX -b 2000000`, while `-p` / subcommands keep working.
+    idx = _find_device(argv)
+    if idx is not None and argv[idx] not in SUBCOMMANDS:
+        dev = argv[idx]
+        has_port_opt = any(a in ("-p", "--port") for a in argv)
+        if has_port_opt:
+            # `-p` already given; just drop the redundant positional device.
+            argv = argv[:idx] + argv[idx + 1:]
+        else:
+            argv = argv[:idx] + ["-p", dev] + argv[idx + 1:]
+
     args = build_parser().parse_args(argv)
+    port = args.port
 
     idle_dtr = {"high": True, "low": False}.get(args.idle_dtr)
     idle_rts = {"high": True, "low": False}.get(args.idle_rts)
@@ -363,15 +407,16 @@ def main(argv=None):
     if args.cmd == "selftest":
         return selftest()
 
-    if not args.port and args.cmd != "selftest":
-        sys.stderr.write("error: -p/--port is required (except for selftest)\n")
+    if not port and args.cmd != "selftest":
+        sys.stderr.write("error: a serial port is required "
+                         "(positional device or -p/--port)\n")
         return 2
     # picocom-like: no subcommand given => default to interactive console.
     if args.cmd is None:
         args.cmd = "console"
 
     if args.cmd == "send":
-        fd = open_safe(args.port, args.baud, args.raw, idle_dtr, idle_rts)
+        fd = open_safe(port, args.baud, args.raw, idle_dtr, idle_rts)
         try:
             send(fd, args.data)
         finally:
@@ -379,7 +424,7 @@ def main(argv=None):
         return 0
 
     if args.cmd == "recv":
-        fd = open_safe(args.port, args.baud, args.raw, idle_dtr, idle_rts)
+        fd = open_safe(port, args.baud, args.raw, idle_dtr, idle_rts)
         try:
             data = recv(fd, args.timeout)
             sys.stdout.buffer.write(data)
@@ -389,7 +434,7 @@ def main(argv=None):
         return 0
 
     if args.cmd == "recv-until":
-        fd = open_safe(args.port, args.baud, args.raw, idle_dtr, idle_rts)
+        fd = open_safe(port, args.baud, args.raw, idle_dtr, idle_rts)
         try:
             data = recv_until(fd, args.pattern, args.timeout)
             sys.stdout.buffer.write(data)
@@ -399,14 +444,14 @@ def main(argv=None):
         return 0
 
     if args.cmd == "status":
-        print(f"port={args.port} baud={args.baud} raw={args.raw} "
+        print(f"port={port} baud={args.baud} raw={args.raw} "
               f"idle_dtr={args.idle_dtr} idle_rts={args.idle_rts}")
         print("note: DTR/RTS are set to the idle-safe level exactly once at "
               "take-over; release and all I/O never touch the modem lines.")
         return 0
 
     if args.cmd == "console":
-        console(args.port, args.baud, args.raw, idle_dtr, idle_rts)
+        console(port, args.baud, args.raw, idle_dtr, idle_rts)
         return 0
 
     sys.stderr.write(f"error: unknown command {args.cmd}\n")

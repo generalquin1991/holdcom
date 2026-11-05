@@ -46,11 +46,15 @@ with `sandbox_apply: Operation not permitted` until you do.
 
 ## Usage
 
-No subcommand = interactive console (like picocom):
+The device may be given as a **positional** argument (picocom-style) or via
+`-p`. No subcommand = interactive console (like picocom):
 
 ```bash
-holdcom -p /dev/cu.usbmodem1101 -b 115200
+holdcom /dev/cu.usbmodem1101 -b 115200
+holdcom -p /dev/cu.usbmodem1101 -b 115200      # equivalent
 ```
+
+Inside the console: type to send, **Ctrl-]** to release and quit.
 
 Programmatic subcommands (for AI / scripts):
 
@@ -61,6 +65,9 @@ holdcom -p /dev/ttyUSB0 recv-until "OK" -t 5
 holdcom -p /dev/ttyUSB0 status
 holdcom selftest
 ```
+
+> Note: when using a subcommand, place options (`-p`/`-b`) **before** the
+> subcommand name — that is how argparse scopes them to `holdcom` itself.
 
 ## The no-reset guarantee
 
