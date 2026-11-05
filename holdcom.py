@@ -33,6 +33,8 @@ import termios
 import threading
 import time
 
+__version__ = "0.1.0"
+
 # TIOCM* constants mean modem-line control. They are permitted ONLY inside
 # `set_idle_state` (called exactly once from `open_safe` at take-over).
 # `selftest` enforces this confinement via an AST scan per function.
@@ -226,7 +228,16 @@ def console(port, baud=None, raw=True, dtr_high=None, rts_high=None):
 
     def writer():
         while not stop.is_set():
-            data = recv(fd, 0.1, 1024)
+            try:
+                data = recv(fd, 0.1, 1024)
+            except OSError as e:
+                # Device gone (e.g. USB unplugged -> ENXIO on macOS) or other
+                # serial I/O failure. Don't dump a raw traceback; tell the user
+                # and let the console exit gracefully.
+                sys.stderr.write(f"\n[console] serial I/O error: {e} "
+                                 "(device disconnected?)\n")
+                stop.set()
+                break
             if data:
                 sys.stdout.buffer.write(data)
                 sys.stdout.buffer.flush()
@@ -315,6 +326,8 @@ def build_parser():
     p = argparse.ArgumentParser(
         prog="holdcom",
         description="On-demand serial take-over without resetting the MCU. No command given = interactive console.")
+    p.add_argument("--version", action="version",
+                   version=f"holdcom {__version__}")
     p.add_argument("-p", "--port", help="serial port (e.g. /dev/cu.usbserial-*)")
     p.add_argument("-b", "--baud", type=int, default=None,
                    help="set baud rate (optional; default = inherit driver setting)")
