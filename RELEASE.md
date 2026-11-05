@@ -6,7 +6,7 @@
 |---|---|---|
 | **pip / PyPI** | `pyproject.toml` `version` + `holdcom.py` `__version__` | 两者必须相等 |
 | **bash** | `install.sh` 拉 `main` 分支的 `holdcom.py` | 永远是 `main` 最新；其内置 `--version` 即 `holdcom.py` 的值 |
-| **brew** | `Formula/holdcom.rb` 的 `url`(tag) + `sha256` | 必须指向**本次** tag 的 tarball 且哈希正确 |
+| **brew** | `Formula/holdcom.rb` 的 `url`(tag) + `sha256` | 必须指向**本次** tag 的 tarball 且哈希正确；公式既在 holdcom 仓库 `Formula/holdcom.rb`，也须同步进公开 tap 仓库 `generalquin1991/homebrew-tap` |
 
 > 铁律：**每次代码改动要发布时，版本号在 `pyproject.toml` 与 `holdcom.py` 同步 +1，打对应 tag，并重算 Formula 的 sha256。** 三者任一落后即视为未对齐。
 
@@ -28,8 +28,10 @@
    # 把 HASH 写进 Formula/holdcom.rb 的 sha256 行
    ```
 6. **提交 Formula 哈希**：`git commit -m "dist: fill sha256 for vX.Y.Z"` → `git push origin main`
-7. **（可选）PyPI**：`python -m build` → `python -m twine upload dist/*`
-8. **本机同步裸命令**：`python3 -m pip install --user .`（或 `-e .` 开发模式）
+7. **同步公式到公开 tap 仓库**：把 `Formula/holdcom.rb` 复制到 `generalquin1991/homebrew-tap` 仓库并提交、推送（用户最终走 `brew tap generalquin1991/tap && brew install holdcom`）。
+8. **（可选）PyPI**：`python -m build` → `python -m twine upload dist/*`
+9. **本机同步裸命令**：`python3 -m pip install --user .`（或 `-e .` 开发模式）
+10. **brew 通道校验**：`brew tap generalquin1991/tap` → `brew trust generalquin1991/tap`（brew 4.x 第三方 tap 必须信任，否则 `sandbox_apply` 报错）→ `brew install holdcom` → 确认 `holdcom --version`
 
 ## 校验（发版后跑一遍）
 

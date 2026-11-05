@@ -30,13 +30,19 @@ pip install holdcom
 curl -fsSL https://raw.githubusercontent.com/generalquin1991/holdcom/main/install.sh | bash
 ```
 
-### Homebrew
+### Homebrew (published tap)
 
 ```bash
-brew install --formula Formula/holdcom.rb   # local, from this repo
-# or, once published in a tap:
-brew tap generalquin1991/tap && brew install holdcom
+brew tap generalquin1991/tap
+brew trust generalquin1991/tap   # required ONCE for 3rd-party taps on brew 4.x
+brew install holdcom
 ```
+
+`holdcom` is a pure-stdlib script; the formula declares **no** Python
+dependency, so it runs with whatever `python3` is already on your PATH
+(macOS built-in, Homebrew, or user-installed). On brew 4.x a third-party tap
+must be `trust`ed before its formulae can install — `brew install` will fail
+with `sandbox_apply: Operation not permitted` until you do.
 
 ## Usage
 
