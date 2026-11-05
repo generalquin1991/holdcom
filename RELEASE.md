@@ -32,6 +32,13 @@
 8. **（可选）PyPI**：`python -m build` → `python -m twine upload dist/*`
 9. **本机同步裸命令**：`python3 -m pip install --user .`（或 `-e .` 开发模式）
 10. **brew 通道校验**：`brew tap generalquin1991/tap` → `brew trust generalquin1991/tap`（brew 4.x 第三方 tap 必须信任，否则 `sandbox_apply` 报错）→ `brew install holdcom` → 确认 `holdcom --version`
+11. **测完清理本机，只留 brew**（关键）：pip/`--user` 与 bash 两份只是测试载体，本机最终只保留 brew 一份，避免 `which holdcom` 命中错版本、三处源码漂移。
+    ```bash
+    python3 -m pip uninstall holdcom -y   # 移除 ~/.local/bin/holdcom + site-packages
+    rm -f ~/bin/holdcom                    # 移除 bash 副本
+    which -a holdcom                       # 应只剩 /opt/homebrew/bin/holdcom
+    ```
+    > 下次发版重新测试时，pip 用 `python3 -m pip install --user .`、bash 用 `curl …/install.sh | bash` 再装回即可；测完照此步清掉。
 
 ## 校验（发版后跑一遍）
 
