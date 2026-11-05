@@ -33,7 +33,7 @@ import termios
 import threading
 import time
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
 # TIOCM* constants mean modem-line control. They are permitted ONLY inside
 # `set_idle_state` (called exactly once from `open_safe` at take-over).
@@ -216,7 +216,8 @@ def recv_until(fd, pattern, timeout=5.0, n=4096):
             return bytes(buf)
 
 
-def console(port, baud=None, raw=True, dtr_high=None, rts_high=None):
+def console(port, baud=None, raw=True, dtr_high=None, rts_high=None,
+           ctrl_c_quit=True):
     """Interactive console for a human. Attach = take over; Ctrl-] = release."""
     import tty
     fd = open_safe(port, baud=baud, raw=raw, dtr_high=dtr_high, rts_high=rts_high)
@@ -237,6 +238,9 @@ def console(port, baud=None, raw=True, dtr_high=None, rts_high=None):
                 except OSError:
                     break
                 if ch == b"\x1d":  # Ctrl-]
+                    stop.set()
+                    break
+                if ctrl_c_quit and ch == b"\x03":  # Ctrl-C
                     stop.set()
                     break
                 try:
@@ -265,7 +269,8 @@ def console(port, baud=None, raw=True, dtr_high=None, rts_high=None):
     t_w = threading.Thread(target=writer, daemon=True)
     t_r.start()
     t_w.start()
-    sys.stderr.write(f"[console] attached to {port}; Ctrl-] to quit\n")
+    sys.stderr.write(f"[console] attached to {port}; "
+                     f"Ctrl-] or Ctrl-C to quit (Ctrl-C passthrough: -I)\n")
     try:
         while not stop.is_set():
             t_r.join(0.2)
@@ -377,7 +382,8 @@ EPILOG = (
     "  holdcom -p /dev/ttyUSB0 recv-until \"OK\" -t 5\n"
     "  holdcom selftest\n"
     "\n"
-    "console: Ctrl-] quits (picocom-like)."
+    "console: Ctrl-] or Ctrl-C quits; -I passes Ctrl-C through to the device\n"
+    "(e.g. for a MicroPython REPL that needs Ctrl-C)."
 )
 
 
@@ -403,6 +409,10 @@ def build_parser():
     p.add_argument("--idle-rts", choices=["high", "low"], default=None,
                    help="RTS level at take-over (default: don't touch). "
                         "Set only if your board needs a specific idle level")
+    p.add_argument("-I", "--int-passthrough", action="store_true",
+                   help="pass Ctrl-C through to the device instead of quitting "
+                        "(use when the target needs Ctrl-C, e.g. a MicroPython "
+                        "REPL); by default Ctrl-C also quits holdcom")
     sub = p.add_subparsers(dest="cmd")
     sub.add_parser("send").add_argument("data")
     ru = sub.add_parser("recv-until")
@@ -545,7 +555,8 @@ def main(argv=None):
         return 0
 
     if args.cmd == "console":
-        console(port, args.baud, args.raw, idle_dtr, idle_rts)
+        console(port, args.baud, args.raw, idle_dtr, idle_rts,
+                ctrl_c_quit=not args.int_passthrough)
         return 0
 
     sys.stderr.write(f"error: unknown command {args.cmd}\n")
