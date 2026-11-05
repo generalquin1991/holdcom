@@ -33,7 +33,7 @@ import termios
 import threading
 import time
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 # TIOCM* constants mean modem-line control. They are permitted ONLY inside
 # `set_idle_state` (called exactly once from `open_safe` at take-over).
@@ -362,10 +362,10 @@ DESCRIPTION = (
     "On-demand serial take-over that NEVER resets the MCU:\n"
     "DTR/RTS are left untouched unless you set --idle-dtr/--idle-rts explicitly.\n"
     "\n"
-    "Name the port either way (the first bare token that is not a subcommand is\n"
-    "treated as the device):\n"
+    "Name the port any of three ways:\n"
     "  holdcom /dev/ttyX -b 115200       picocom-style positional\n"
     "  holdcom -p /dev/ttyX -b 115200     explicit -p\n"
+    "  holdcom -b 115200                 omit it -> auto-use the only device\n"
     "Omit the command to drop into an interactive console."
 )
 
@@ -387,11 +387,11 @@ def build_parser():
         formatter_class=_HelpFormatter,
         description=DESCRIPTION,
         epilog=EPILOG)
-    p.add_argument("--version", action="version",
+    p.add_argument("-v", "--version", action="version",
                    version=f"holdcom {__version__}")
     p.add_argument("-p", "--port",
                    help="serial port, e.g. /dev/cu.usbmodem1101 "
-                        "(also accepted as a positional)")
+                        "(positional also works; omit to auto-pick the only device)")
     p.add_argument("-b", "--baud", type=int, default=None,
                    help="baud rate (optional; default: inherit driver setting)")
     p.add_argument("-r", "--raw", action="store_true",
@@ -434,6 +434,33 @@ def _find_device(argv):
     return None
 
 
+def _auto_detect_port():
+    """Scan for serial devices and return them sorted. Used when neither a
+    positional device nor `-p/--port` is given, so `holdcom` with no port just
+    works when exactly one device is attached.
+
+    Returns a sorted list of candidate device paths (may be empty)."""
+    import glob
+    if sys.platform == "darwin":
+        # Only real USB-serial adapters (CP210x/CDC/FTDI). macOS also exposes
+        # paired-Bluetooth, debug-console and wlan-debug as /dev/cu.* which are
+        # never the target, so we do NOT scan the bare /dev/cu.* glob.
+        patterns = ["/dev/cu.usbmodem*", "/dev/cu.usbserial*"]
+        skip = ()
+    elif sys.platform.startswith("linux"):
+        patterns = ["/dev/ttyUSB*", "/dev/ttyACM*"]
+        skip = ()
+    else:
+        patterns = ["/dev/cu.*", "/dev/ttyUSB*", "/dev/ttyACM*"]
+        skip = ()
+    found = set()
+    for pat in patterns:
+        for dev in glob.glob(pat):
+            if not any(s in dev for s in skip):
+                found.add(dev)
+    return sorted(found)
+
+
 def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
@@ -462,10 +489,22 @@ def main(argv=None):
     if args.cmd == "selftest":
         return selftest()
 
-    if not port and args.cmd != "selftest":
-        sys.stderr.write("error: a serial port is required "
-                         "(positional device or -p/--port)\n")
-        return 2
+    if not port:
+        candidates = _auto_detect_port()
+        if len(candidates) == 1:
+            port = candidates[0]
+            sys.stderr.write(f"[holdcom] no port given; auto-selected {port}\n")
+        elif not candidates:
+            sys.stderr.write("error: no serial port found. Plug in a device or "
+                             "name one explicitly:\n"
+                             "  holdcom /dev/cu.usbmodem1101 -b 115200\n")
+            return 2
+        else:
+            sys.stderr.write("error: multiple serial ports found; name one with "
+                             "-p/device:\n")
+            for c in candidates:
+                sys.stderr.write(f"  {c}\n")
+            return 2
     # picocom-like: no subcommand given => default to interactive console.
     if args.cmd is None:
         args.cmd = "console"
