@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "holdcom"
-version = "0.1.3"
+version = "0.1.4"
 description = "On-demand serial take-over without resetting the MCU (picocom-like, no flow-control touch)."
 readme = "README.md"
 license = "MIT"

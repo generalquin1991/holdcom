@@ -33,7 +33,7 @@ import termios
 import threading
 import time
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 # TIOCM* constants mean modem-line control. They are permitted ONLY inside
 # `set_idle_state` (called exactly once from `open_safe` at take-over).
@@ -346,27 +346,63 @@ def selftest():
 SUBCOMMANDS = {"send", "recv", "recv-until", "status", "console", "selftest"}
 
 
+class _HelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Keep our explicit line breaks in the description/epilog, and print a
+    fixed usage block instead of argparse's auto-wrapped one (which dangles the
+    subcommand metavar on its own line and hard-breaks sentences mid-word)."""
+
+    def _format_usage(self, usage, actions, groups, prefix):
+        return (
+            "usage: holdcom [options] [device] [command [args]]\n"
+            "       holdcom /dev/ttyX -b 115200   (interactive console)\n"
+        )
+
+
+DESCRIPTION = (
+    "On-demand serial take-over that NEVER resets the MCU:\n"
+    "DTR/RTS are left untouched unless you set --idle-dtr/--idle-rts explicitly.\n"
+    "\n"
+    "Name the port either way (the first bare token that is not a subcommand is\n"
+    "treated as the device):\n"
+    "  holdcom /dev/ttyX -b 115200       picocom-style positional\n"
+    "  holdcom -p /dev/ttyX -b 115200     explicit -p\n"
+    "Omit the command to drop into an interactive console."
+)
+
+EPILOG = (
+    "examples:\n"
+    "  holdcom /dev/tty.usbmodem1101 -b 2000000\n"
+    "  holdcom -p /dev/ttyUSB0 -b 115200 send \"AT\\r\\n\"\n"
+    "  holdcom -p /dev/ttyUSB0 recv -t 2\n"
+    "  holdcom -p /dev/ttyUSB0 recv-until \"OK\" -t 5\n"
+    "  holdcom selftest\n"
+    "\n"
+    "console: Ctrl-] quits (picocom-like)."
+)
+
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="holdcom",
-        description="On-demand serial take-over without resetting the MCU. "
-                    "Pass the device as a positional (picocom-style) or via -p; "
-                    "no command given = interactive console.")
+        formatter_class=_HelpFormatter,
+        description=DESCRIPTION,
+        epilog=EPILOG)
     p.add_argument("--version", action="version",
                    version=f"holdcom {__version__}")
-    p.add_argument("-p", "--port", help="serial port (e.g. /dev/cu.usbserial-*)")
+    p.add_argument("-p", "--port",
+                   help="serial port, e.g. /dev/cu.usbmodem1101 "
+                        "(also accepted as a positional)")
     p.add_argument("-b", "--baud", type=int, default=None,
-                   help="set baud rate (optional; default = inherit driver setting)")
+                   help="baud rate (optional; default: inherit driver setting)")
     p.add_argument("-r", "--raw", action="store_true",
-                   help="apply raw mode at take-over (single tcsetattr, no modem touch)")
+                   help="raw mode: disable echo/line editing at take-over "
+                        "(no modem touch)")
     p.add_argument("--idle-dtr", choices=["high", "low"], default=None,
-                   help="DTR level at take-over (optional; default = do NOT "
-                        "touch DTR). Set only if your board needs a specific "
-                        "idle level to avoid reset.")
+                   help="DTR level at take-over (default: don't touch). "
+                        "Set only if your board needs a specific idle level")
     p.add_argument("--idle-rts", choices=["high", "low"], default=None,
-                   help="RTS level at take-over (optional; default = do NOT "
-                        "touch RTS). Set only if your board needs a specific "
-                        "idle level to avoid reset.")
+                   help="RTS level at take-over (default: don't touch). "
+                        "Set only if your board needs a specific idle level")
     sub = p.add_subparsers(dest="cmd")
     sub.add_parser("send").add_argument("data")
     ru = sub.add_parser("recv-until")
