@@ -33,7 +33,7 @@ import termios
 import threading
 import time
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # TIOCM* constants mean modem-line control. They are permitted ONLY inside
 # `set_idle_state` (called exactly once from `open_safe` at take-over).

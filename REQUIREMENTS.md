@@ -119,7 +119,7 @@
 ### 通道 3：Homebrew formula（已写 `Formula/holdcom.rb`，可选）
 - 公式把 `holdcom.py` 装进 `bin/holdcom`（无编译，纯 stdlib；用 `write_exec_script`
   包一层 brewed python 解释器），依赖稳定源 URL。
-- 发布前需替换：`generalquin1991`、真实 `sha256`、`v0.1.0` tag；并定 license + LICENSE 文件。
+- 发布前需替换：真实 `sha256`（对应本次 `v0.1.1` tag 的 tarball）；`generalquin1991`/`LICENSE` 已就位。
 - 本地免 tap 安装：`brew install --formula Formula/holdcom.rb`；
   正式分发需自建 tap（如 `yourname/homebrew-tap`）或提交上游。属增强项，非阻塞。
 
