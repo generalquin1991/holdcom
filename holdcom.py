@@ -20,9 +20,20 @@ deasserted). Release (close) and every send/recv never touch the modem lines.
 Static guarantee: TIOCM* ioctls appear ONLY in `set_idle_state` (called at most
 once from `open_safe`, and only when an override is requested). Enforced by
 `selftest` (AST scan per function).
+
+Two programmatic building blocks sit on top of the byte path:
+  * `recv_until()` returns a `RecvResult` whose `.status` is one of MATCHED /
+    TIMEOUT / DISCONNECTED / ERROR — so a caller can tell a real match from a
+    timeout or a gone device instead of blindly treating returned bytes as a win.
+  * `Session` is a context manager that holds ONE take-over open so the caller
+    can send -> wait -> release in a single controlled transaction (no gaps
+    between separate CLI invocations). The CLI `txn` subcommand is the
+    scriptable form of the same idea.
 """
 import argparse
 import ast
+import dataclasses
+import enum
 import errno
 import fcntl
 import os
@@ -32,12 +43,47 @@ import sys
 import termios
 import threading
 import time
+import typing
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 
 # TIOCM* constants mean modem-line control. They are permitted ONLY inside
 # `set_idle_state` (called exactly once from `open_safe` at take-over).
 # `selftest` enforces this confinement via an AST scan per function.
+
+
+class PortDisconnected(OSError):
+    """Raised by recv/recv_until when the serial device is gone (e.g. USB
+    unplugged). It subclasses OSError so the interactive console's generic
+    OSError handler still catches it and exits gracefully."""
+
+
+class RecvStatus(enum.Enum):
+    MATCHED = "matched"
+    TIMEOUT = "timeout"
+    DISCONNECTED = "disconnected"
+    ERROR = "error"
+
+
+@dataclasses.dataclass
+class RecvResult:
+    status: RecvStatus
+    data: bytes
+    error: typing.Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        """True ONLY when the pattern actually matched. A timeout, a device
+        disconnect, or any other I/O error is NOT success — callers must check
+        `.ok` / `.status` and must not treat a non-match as a win."""
+        return self.status is RecvStatus.MATCHED
+
+
+# CLI exit codes so a non-match is never mistaken for success by a caller.
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_TIMEOUT = 2
+EXIT_DISCONNECT = 3
 
 
 def open_safe(port, baud=None, raw=False, dtr_high=None, rts_high=None):
@@ -197,29 +243,143 @@ def recv(fd, timeout=1.0, n=4096):
             return os.read(fd, n)
         except BlockingIOError:
             return b""
+        except OSError as e:
+            # Device gone (e.g. USB unplugged -> ENXIO/EIO on macOS/Linux) or
+            # some other serial failure. Surface a typed disconnect so callers
+            # can tell it apart from a plain (data-empty) timeout.
+            if e.errno in (errno.ENXIO, errno.ENODEV, errno.EIO):
+                raise PortDisconnected(e.errno, str(e)) from e
+            raise
     return b""
 
 
 def recv_until(fd, pattern, timeout=5.0, n=4096):
+    """Wait until `pattern` appears in the received stream, or until `timeout`
+    seconds elapse. Returns a RecvResult whose `.status` is one of MATCHED /
+    TIMEOUT / DISCONNECTED / ERROR — so a caller can distinguish a real match
+    from a timeout or a gone device instead of blindly treating the returned
+    bytes as success.
+
+    DISCONNECTED is returned when the device vanishes mid-wait (e.g. USB
+    unplugged; ENXIO/EIO). ERROR covers any other I/O failure. The captured
+    bytes-so-far always travel along in `.data` for logging/debugging.
+    """
     if isinstance(pattern, str):
         pattern = pattern.encode()
     buf = bytearray()
     end = time.monotonic() + timeout
     while True:
         remaining = end - time.monotonic()
-        chunk = recv(fd, max(0.0, remaining), n) if remaining > 0 else b""
+        if remaining <= 0:
+            return RecvResult(RecvStatus.TIMEOUT, bytes(buf))
+        try:
+            chunk = recv(fd, remaining, n)
+        except PortDisconnected as e:
+            return RecvResult(RecvStatus.DISCONNECTED, bytes(buf), str(e))
+        except OSError as e:
+            return RecvResult(RecvStatus.ERROR, bytes(buf), str(e))
         if chunk:
             buf.extend(chunk)
             if pattern in buf:
-                return bytes(buf)
-        if time.monotonic() >= end:
-            return bytes(buf)
+                return RecvResult(RecvStatus.MATCHED, bytes(buf))
+
+
+class Session:
+    """A single serial take-over held open for a transaction: open once, send /
+    recv / recv_until as many times as needed, then close once.
+
+    This removes the timing ambiguity of firing separate `holdcom send` /
+    `holdcom recv-until` CLI invocations (each opens and closes the port, with
+    an uncontrolled gap in between). Within one Session the caller controls the
+    exact send -> wait -> release sequence.
+
+    Usage:
+        with Session("/dev/cu.usbmodem1101", baud=115200) as s:
+            s.send("AT\\r\\n")                      # pass $'...' from a shell
+            res = s.recv_until("OK", timeout=2.0)
+            if res.ok:
+                print("got response:", res.data)
+        # close() runs automatically on __exit__ (release, no reset).
+
+    Like every holdcom entry point, the only modem-line touch is the optional
+    one-time idle set in open_safe (only if idle_dtr/idle_rts are given);
+    opening, sending, and closing never flip DTR/RTS.
+    """
+
+    def __init__(self, port, baud=None, raw=False, idle_dtr=None, idle_rts=None):
+        self.fd = open_safe(port, baud=baud, raw=raw,
+                            dtr_high=idle_dtr, rts_high=idle_rts)
+
+    def send(self, data, timeout=5.0):
+        send(self.fd, data, timeout)
+
+    def recv(self, timeout=1.0, n=4096):
+        return recv(self.fd, timeout, n)
+
+    def recv_until(self, pattern, timeout=5.0, n=4096):
+        return recv_until(self.fd, pattern, timeout, n)
+
+    def close(self):
+        if self.fd is not None:
+            close_safe(self.fd)
+            self.fd = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+
+class _Tee:
+    """Write serial bytes to stdout AND (optionally) a file. Used by --output
+    so the default always stays stdout and holdcom never writes to /tmp unless
+    the caller points --output there explicitly."""
+
+    def __init__(self, path=None):
+        self._f = open(path, "wb") if path else None
+
+    def write(self, b):
+        sys.stdout.buffer.write(b)
+        sys.stdout.buffer.flush()
+        if self._f is not None:
+            self._f.write(b)
+            self._f.flush()
+
+    def close(self):
+        if self._f is not None:
+            self._f.close()
+            self._f = None
+
+
+def _emit_recv_result(res, tee):
+    """Write the captured serial bytes (stdout + optional file) and print a
+    machine-readable status line on stderr so stdout stays pure serial data
+    for piping."""
+    tee.write(res.data)
+    line = f"[recv] status={res.status.value} bytes={len(res.data)}"
+    if res.error:
+        line += f" error={res.error}"
+    sys.stderr.write(line + "\n")
+
+
+def _exit_for_status(status):
+    return {
+        RecvStatus.MATCHED: EXIT_OK,
+        RecvStatus.TIMEOUT: EXIT_TIMEOUT,
+        RecvStatus.DISCONNECTED: EXIT_DISCONNECT,
+        RecvStatus.ERROR: EXIT_ERROR,
+    }[status]
 
 
 def console(port, baud=None, raw=True, dtr_high=None, rts_high=None,
-           ctrl_c_quit=True):
-    """Interactive console for a human. Attach = take over; Ctrl-] = release."""
+           ctrl_c_quit=True, output=None):
+    """Interactive console for a human. Attach = take over; Ctrl-] = release.
+    `output`, if given, also saves the serial stream to that file (stdout is
+    still shown)."""
     import tty
+    tee = _Tee(output)
     fd = open_safe(port, baud=baud, raw=raw, dtr_high=dtr_high, rts_high=rts_high)
     try:
         stdin_fd = sys.stdin.fileno()
@@ -262,8 +422,7 @@ def console(port, baud=None, raw=True, dtr_high=None, rts_high=None,
                 stop.set()
                 break
             if data:
-                sys.stdout.buffer.write(data)
-                sys.stdout.buffer.flush()
+                tee.write(data)
 
     t_r = threading.Thread(target=reader, daemon=True)
     t_w = threading.Thread(target=writer, daemon=True)
@@ -280,8 +439,30 @@ def console(port, baud=None, raw=True, dtr_high=None, rts_high=None,
         t_w.join(0.5)
         if old is not None:
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
+        tee.close()
         close_safe(fd)
         sys.stderr.write("[console] released\n")
+
+
+def _cmd_config(port, args):
+    """Report the resolved take-over configuration. Honest about what it does
+    and does NOT do: it never opens the port and never queries live modem-line
+    levels, because opening would assert DTR on some drivers and could reset
+    the MCU — the very thing this tool exists to avoid."""
+    idle_dtr = args.idle_dtr if args.idle_dtr else "untouched (no modem ioctl)"
+    idle_rts = args.idle_rts if args.idle_rts else "untouched (no modem ioctl)"
+    print("holdcom configuration (resolved take-over settings):")
+    print(f"  port      : {port if port else '(auto-detect when omitted)'}")
+    print(f"  baud      : {args.baud if args.baud is not None else 'inherit driver setting'}")
+    print(f"  raw       : {args.raw}")
+    print(f"  idle DTR  : {idle_dtr}")
+    print(f"  idle RTS  : {idle_rts}")
+    print()
+    print("NOTE: this reports the configuration holdcom WILL apply at take-over.")
+    print("It does NOT open the port and does NOT query live modem-line levels")
+    print("(opening would assert DTR on some drivers and could reset the MCU).")
+    print("To read real-time line state, open the port with another tool (which")
+    print("accepts the DTR assertion) or call ioctl(TIOCMGET) yourself.")
 
 
 def selftest():
@@ -292,7 +473,8 @@ def selftest():
     ALLOWED = {"open_safe", "set_idle_state"}   # the one sanctioned place
     FORBIDDEN = {"close_safe", "send", "recv", "recv_until", "console",
                  "status", "main", "selftest", "build_parser",
-                 "_readable", "_writable"}
+                 "_readable", "_writable", "Session", "_emit_recv_result",
+                 "_cmd_config"}
 
     def idents_in(fn):
         s = set()
@@ -348,7 +530,8 @@ def selftest():
 
 # Known subcommands. A bare token that is NOT one of these is treated as the
 # serial device (picocom-style positional), so `holdcom /dev/ttyX` just works.
-SUBCOMMANDS = {"send", "recv", "recv-until", "status", "console", "selftest"}
+SUBCOMMANDS = {"send", "recv", "recv-until", "status", "config", "txn",
+               "console", "selftest"}
 
 
 class _HelpFormatter(argparse.RawDescriptionHelpFormatter):
@@ -371,19 +554,33 @@ DESCRIPTION = (
     "  holdcom /dev/ttyX -b 115200       picocom-style positional\n"
     "  holdcom -p /dev/ttyX -b 115200     explicit -p\n"
     "  holdcom -b 115200                 omit it -> auto-use the only device\n"
-    "Omit the command to drop into an interactive console."
+    "Omit the command to drop into an interactive console.\n"
+    "\n"
+    "recv-until / txn report an explicit status (matched / timeout /\n"
+    "disconnected / error) and use distinct exit codes, so a non-match is\n"
+    "never mistaken for success."
 )
+
+OUTPUT_HELP = ("write captured serial data to this file as well as stdout "
+               "(audit log). Default: stdout only; holdcom never writes to "
+               "/tmp unless you point --output there.")
 
 EPILOG = (
     "examples:\n"
     "  holdcom /dev/tty.usbmodem1101 -b 2000000\n"
     "  holdcom -p /dev/ttyUSB0 -b 115200 send \"AT\\r\\n\"\n"
     "  holdcom -p /dev/ttyUSB0 recv -t 2\n"
-    "  holdcom -p /dev/ttyUSB0 recv-until \"OK\" -t 5\n"
+    "  holdcom -p /dev/ttyUSB0 recv-until \"OK\" -t 5        # exit 0=matched 2=timeout 3=disconnected 1=error\n"
+    "  holdcom -p /dev/ttyUSB0 txn --send $'AT\\r\\n' --until \"OK\" -t 5   # one takeover: send+wait+release\n"
+    "  holdcom -p /dev/ttyUSB0 config                    # show resolved config (no port open)\n"
+    "  holdcom -p /dev/ttyUSB0 recv-until \"OK\" -t 5 --output session.log   # also save to file\n"
     "  holdcom selftest\n"
     "\n"
     "console: Ctrl-] or Ctrl-C quits; -I passes Ctrl-C through to the device\n"
-    "(e.g. for a MicroPython REPL that needs Ctrl-C)."
+    "(e.g. for a MicroPython REPL that needs Ctrl-C).\n"
+    "\n"
+    "Library: `from holdcom import Session, recv_until, RecvResult, RecvStatus`\n"
+    "for scripted send -> wait -> release without subprocess gaps."
 )
 
 
@@ -413,15 +610,34 @@ def build_parser():
                    help="pass Ctrl-C through to the device instead of quitting "
                         "(use when the target needs Ctrl-C, e.g. a MicroPython "
                         "REPL); by default Ctrl-C also quits holdcom")
+    p.add_argument("--output", default=None, help=OUTPUT_HELP)
     sub = p.add_subparsers(dest="cmd")
     sub.add_parser("send").add_argument("data")
     ru = sub.add_parser("recv-until")
     ru.add_argument("pattern")
     ru.add_argument("-t", "--timeout", type=float, default=5.0)
+    ru.add_argument("--output", default=None, help=OUTPUT_HELP)
     rr = sub.add_parser("recv")
     rr.add_argument("-t", "--timeout", type=float, default=1.0)
-    sub.add_parser("status")
-    sub.add_parser("console", help="interactive console (default when no command given)")
+    rr.add_argument("--output", default=None, help=OUTPUT_HELP)
+    cfg = sub.add_parser("config",
+                         help="show the resolved take-over configuration "
+                              "(does NOT open the port or query live line state)")
+    sub.add_parser("status", help="DEPRECATED alias for 'config'")
+    txn = sub.add_parser("txn",
+                         help="transaction: open once, optionally send, wait "
+                              "for a pattern (or time out), then release")
+    txn.add_argument("--send", default=None,
+                     help="data to send at take-over (optional). Use shell "
+                          "$'...' for control chars, e.g. $'AT\\r\\n'")
+    txn.add_argument("--until", default=None,
+                     help="wait until this pattern appears in the response")
+    txn.add_argument("-t", "--timeout", type=float, default=5.0,
+                     help="max seconds to wait for --until (or for a plain capture)")
+    txn.add_argument("--output", default=None, help=OUTPUT_HELP)
+    con = sub.add_parser("console",
+                         help="interactive console (default when no command given)")
+    con.add_argument("--output", default=None, help=OUTPUT_HELP)
     sub.add_parser("selftest")
     return p
 
@@ -430,7 +646,8 @@ def _find_device(argv):
     """Index of the first token that is a standalone (non-option, non-option-
     value) positional, or None. Used to detect a picocom-style leading device
     path while ignoring option values such as the argument of `-p`/`-b`."""
-    opts_with_val = {"-p", "--port", "-b", "--baud", "--idle-dtr", "--idle-rts"}
+    opts_with_val = {"-p", "--port", "-b", "--baud", "--idle-dtr",
+                     "--idle-rts", "--output"}
     i, n = 0, len(argv)
     while i < n:
         a = argv[i]
@@ -499,7 +716,15 @@ def main(argv=None):
     if args.cmd == "selftest":
         return selftest()
 
-    if not port:
+    # picocom-like: no subcommand given => default to interactive console.
+    if args.cmd is None:
+        args.cmd = "console"
+
+    # Commands that need a real port: auto-detect when none was named.
+    # `config`/`status` only report the intended configuration and must NOT
+    # open a port (opening would assert DTR and could reset the MCU).
+    NEEDS_PORT = {"send", "recv", "recv-until", "txn", "console"}
+    if not port and args.cmd in NEEDS_PORT:
         candidates = _auto_detect_port()
         if len(candidates) == 1:
             port = candidates[0]
@@ -515,9 +740,6 @@ def main(argv=None):
             for c in candidates:
                 sys.stderr.write(f"  {c}\n")
             return 2
-    # picocom-like: no subcommand given => default to interactive console.
-    if args.cmd is None:
-        args.cmd = "console"
 
     if args.cmd == "send":
         fd = open_safe(port, args.baud, args.raw, idle_dtr, idle_rts)
@@ -529,34 +751,55 @@ def main(argv=None):
 
     if args.cmd == "recv":
         fd = open_safe(port, args.baud, args.raw, idle_dtr, idle_rts)
+        tee = _Tee(args.output)
         try:
             data = recv(fd, args.timeout)
-            sys.stdout.buffer.write(data)
-            sys.stdout.buffer.flush()
+            tee.write(data)
         finally:
+            tee.close()
             close_safe(fd)
         return 0
 
     if args.cmd == "recv-until":
         fd = open_safe(port, args.baud, args.raw, idle_dtr, idle_rts)
+        tee = _Tee(args.output)
         try:
-            data = recv_until(fd, args.pattern, args.timeout)
-            sys.stdout.buffer.write(data)
-            sys.stdout.buffer.flush()
+            res = recv_until(fd, args.pattern, args.timeout)
+            _emit_recv_result(res, tee)
         finally:
+            tee.close()
             close_safe(fd)
-        return 0
+        return _exit_for_status(res.status)
 
-    if args.cmd == "status":
-        print(f"port={port} baud={args.baud} raw={args.raw} "
-              f"idle_dtr={args.idle_dtr} idle_rts={args.idle_rts}")
-        print("note: DTR/RTS are set to the idle-safe level exactly once at "
-              "take-over; release and all I/O never touch the modem lines.")
+    if args.cmd == "txn":
+        fd = open_safe(port, args.baud, args.raw, idle_dtr, idle_rts)
+        tee = _Tee(args.output)
+        try:
+            if args.send is not None:
+                send(fd, args.send)
+                sys.stderr.write(f"[txn] sent {len(args.send)} bytes\n")
+            if args.until is not None:
+                res = recv_until(fd, args.until, args.timeout)
+                _emit_recv_result(res, tee)
+                return _exit_for_status(res.status)
+            # No --until: just capture whatever arrives within the timeout.
+            data = recv(fd, args.timeout)
+            tee.write(data)
+            sys.stderr.write(f"[txn] captured {len(data)} bytes (no --until)\n")
+            return 0
+        finally:
+            tee.close()
+            close_safe(fd)
+
+    if args.cmd in ("status", "config"):
+        if args.cmd == "status":
+            sys.stderr.write("warning: 'status' is deprecated; use 'config'\n")
+        _cmd_config(port, args)
         return 0
 
     if args.cmd == "console":
         console(port, args.baud, args.raw, idle_dtr, idle_rts,
-                ctrl_c_quit=not args.int_passthrough)
+                ctrl_c_quit=not args.int_passthrough, output=args.output)
         return 0
 
     sys.stderr.write(f"error: unknown command {args.cmd}\n")

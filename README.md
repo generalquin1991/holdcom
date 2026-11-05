@@ -62,12 +62,77 @@ Programmatic subcommands (for AI / scripts):
 holdcom -p /dev/ttyUSB0 -b 115200 send "AT\r\n"
 holdcom -p /dev/ttyUSB0 recv -t 2
 holdcom -p /dev/ttyUSB0 recv-until "OK" -t 5
-holdcom -p /dev/ttyUSB0 status
+holdcom -p /dev/ttyUSB0 txn --send $'AT\r\n' --until "OK" -t 5
+holdcom -p /dev/ttyUSB0 config
 holdcom selftest
 ```
 
 > Note: when using a subcommand, place options (`-p`/`-b`) **before** the
 > subcommand name — that is how argparse scopes them to `holdcom` itself.
+> For control characters in `send` / `--send`, use shell ANSI-C quoting,
+> e.g. `$'AT\r\n'` (a literal `AT\r\n` string would be sent verbatim).
+
+### `recv-until` reports an explicit outcome
+
+`recv-until` no longer returns "success" just because bytes arrived. It prints a
+machine-readable status line on **stderr** and uses a distinct **exit code** so a
+caller can tell a real match from a timeout or a gone device:
+
+| exit | status (stderr) | meaning |
+|------|-----------------|---------|
+| `0`  | `matched`       | pattern found — real success |
+| `2`  | `timeout`       | pattern NOT found within `-t` |
+| `3`  | `disconnected`  | device vanished mid-wait (e.g. USB unplugged) |
+| `1`  | `error`         | other serial I/O failure |
+
+The raw serial bytes always go to **stdout** (for piping); the status line goes
+to stderr. Check the exit code / `.status`, never assume non-empty output means
+a match.
+
+### `txn` — one takeover, send → wait → release
+
+Firing separate `send` and `recv-until` invocations opens and closes the port
+twice, with an uncontrolled gap in between. `txn` holds a **single** take-over
+open, optionally sends, waits for a pattern (or just captures for `-t`), then
+releases — removing the timing ambiguity:
+
+```bash
+holdcom -p /dev/ttyUSB0 -r txn --send $'AT\r\n' --until "OK" -t 5
+# exit code follows the recv-until table above
+```
+
+### `config` (was `status`)
+
+`config` shows the **resolved take-over configuration** holdcom *will* apply. It
+does **not** open the port and does **not** query live modem-line levels —
+opening would assert DTR on some drivers and could reset the MCU, which this
+tool exists to avoid. The old `status` name is kept as a deprecated alias that
+prints a warning and delegates to `config`.
+
+### Save a log on demand (`--output`)
+
+`recv`, `recv-until`, `txn` and `console` accept `--output <path>` to also write
+the captured serial stream to a file. The **default is always stdout**; holdcom
+never writes to `/tmp` unless you point `--output` there explicitly.
+
+### Library / transaction API
+
+For scripted driving without subprocess gaps, import the building blocks:
+
+```python
+from holdcom import Session, RecvResult, RecvStatus
+
+with Session("/dev/cu.usbmodem1101", baud=115200, raw=True) as s:
+    s.send("AT\r\n")                 # str is encoded; pass raw bytes if needed
+    res = s.recv_until("OK", timeout=2.0)
+    if res.ok:                       # True ONLY on a real match
+        print("response:", res.data)
+# close() runs on __exit__ (release, no reset)
+```
+
+`recv_until()` returns a `RecvResult(status, data, error)` whose `.status` is one
+of `MATCHED / TIMEOUT / DISCONNECTED / ERROR` and whose `.ok` is `True` only on a
+match.
 
 ## The no-reset guarantee
 

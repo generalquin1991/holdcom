@@ -51,4 +51,8 @@ holdcom selftest           # 静态扫描 + pty 回环通过
 
 ## 当前版本
 
-- `0.1.6` — 最新（见 `git tag` 与两处版本号）
+- `0.1.7` — 最新（见 `git tag` 与两处版本号）
+  - recv-until 区分 matched/timeout/disconnected/error，返回明确退出码（0/2/3/1）
+  - `status` 改名 `config`（报告将要应用的配置，不开端口、不查实时线路电平）；`status` 保留为废弃别名
+  - 新增事务接口：库 `Session` 类 + CLI `txn`（一次接管内 send→等待→释放）
+  - 新增 `--output <path>` 按需保存日志；默认仍写 stdout，绝不默认写 /tmp
