@@ -33,7 +33,7 @@ import termios
 import threading
 import time
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 # TIOCM* constants mean modem-line control. They are permitted ONLY inside
 # `set_idle_state` (called exactly once from `open_safe` at take-over).
@@ -76,22 +76,41 @@ def open_safe(port, baud=None, raw=False, dtr_high=None, rts_high=None):
         attrs[6][termios.VMIN] = 1
         attrs[6][termios.VTIME] = 0
 
+    baud_set_via_termios = False
     if baud is not None:
         bc = getattr(termios, f"B{baud}", None)
-        if bc is None:
-            raise ValueError(f"unsupported baud rate: {baud}")
-        # Portable baud set: cfsetspeed is Linux-only. On macOS/BSD the
-        # ispeed/ospeed fields live at indices 4/5 of the tcgetattr list.
-        if hasattr(termios, "cfsetspeed"):
-            termios.cfsetspeed(attrs, bc)
-        else:
-            attrs[4] = bc
-            attrs[5] = bc
+        if bc is not None:
+            # Portable baud set: cfsetspeed is Linux-only. On macOS/BSD the
+            # ispeed/ospeed fields live at indices 4/5 of the tcgetattr list.
+            if hasattr(termios, "cfsetspeed"):
+                termios.cfsetspeed(attrs, bc)
+            else:
+                attrs[4] = bc
+                attrs[5] = bc
+            baud_set_via_termios = True
+        # else: no named B-constant for this rate (e.g. macOS lacks B2000000).
+        # Defer to the macOS IOSSIOSPEED ioctl below, which sets an arbitrary
+        # baud rate directly.
 
     # ONE tcsetattr: applies HUPCL-clear (+ optional baud/raw). On some
     # drivers tcsetattr (term_apply) resets DTR/RTS, so if an idle level was
     # requested we re-assert it immediately afterwards (picocom does the same).
     termios.tcsetattr(fd, termios.TCSANOW, attrs)
+
+    # macOS arbitrary baud: when there is no named B-constant, set the rate via
+    # the Darwin-only IOSSIOSPEED ioctl. This MUST run after tcsetattr, which
+    # would otherwise reset the speed to the value stored in the termios
+    # struct. IOSSIOSPEED only changes the line speed — it does NOT touch
+    # DTR/RTS, so the no-reset guarantee is preserved.
+    if baud is not None and not baud_set_via_termios:
+        if sys.platform == "darwin":
+            try:
+                fcntl.ioctl(fd, 0x80045402, struct.pack("I", baud))
+            except OSError as e:
+                raise ValueError(f"cannot set baud {baud} on this platform: {e}")
+        else:
+            raise ValueError(f"unsupported baud rate: {baud}")
+
     set_idle_state(fd, dtr_high=dtr_high, rts_high=rts_high)
     return fd
 
