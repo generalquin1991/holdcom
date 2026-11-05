@@ -94,3 +94,19 @@
   `open_safe → TIOCMGET 读线态 → 3s 收数 → 扫描复位签名（ESP-ROM / rst:0x /
   boot: 等）→ close_safe`；`selftest` 静态扫描仍通过（TIOCM 仅在 `set_idle_state`，
   默认 no-op）。
+
+## 发布（像 picocom 一样一行安装、裸命令调用）
+- 本工具是纯 Python（仅标准库），用 **PyPI + pip** 作为与 picocom 的
+  `brew install picocom` 对等的发布通道。发布定义见仓库根 `pyproject.toml`
+  （entry point `holdcom = holdcom:main`；安装后 PATH 里出现裸 `holdcom` 命令）。
+- 发布流程（在**有 setuptools + 网络**的机器上）：
+  1. `python -m build`              # 产出 dist/holdcom-*.whl 与 .tar.gz
+  2. `python -m twine upload dist/*` # 上传 PyPI
+  3. 他人：`pip install holdcom` → 裸 `holdcom` 命令（等价于 `brew install picocom`）
+  4. 本地开发：`pip install .` / `pip install -e .` 也能得到裸命令。
+- **本机限制**（WorkBuddy 自带 python 3.13）：无 setuptools、无外网，
+  `pip install .` 无法进行。这是环境限制，不是发布定义的问题。
+  该机器上要立刻裸命令调用，可用软链兜底：
+  `ln -sf "$(pwd)/holdcom.py" ~/bin/holdcom`（`~/bin` 已在 PATH，脚本纯标准库）。
+- 可选增强（非必需）：再做一个 Homebrew formula（tap）让 macOS 用户也能
+  `brew install holdcom`，进一步对齐 picocom 的分发形态。

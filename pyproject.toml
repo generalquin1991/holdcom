@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "holdcom"
+version = "0.1.0"
+description = "On-demand serial take-over without resetting the MCU (picocom-like, no flow-control touch)."
+readme = "REQUIREMENTS.md"
+requires-python = ">=3.8"
+keywords = ["serial", "picocom", "esp32", "no-reset", "uart"]
+
+[project.scripts]
+holdcom = "holdcom:main"
+
+[tool.setuptools]
+py-modules = ["holdcom"]
