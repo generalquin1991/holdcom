@@ -20,7 +20,7 @@ class Holdcom < Formula
   desc "On-demand serial take-over without resetting the MCU (picocom-like)"
   homepage "https://github.com/generalquin1991/holdcom"
   url "https://raw.githubusercontent.com/generalquin1991/holdcom/v0.1.0/holdcom.py"
-  sha256 "0000000000000000000000000000000000000000000000000000000000000000" # TODO: replace
+  sha256 "f26d27e64ea4b82c434234e7ab01116d3b860cc3afe0b307e9ad30319ad42d23"
   version "0.1.0"
   license "MIT"
 
