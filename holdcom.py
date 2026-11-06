@@ -60,7 +60,7 @@ import threading
 import time
 import typing
 
-__version__ = "0.1.9"
+__version__ = "0.1.10"
 
 # TIOCM* constants mean modem-line control. They are permitted ONLY inside
 # `set_idle_state` (called exactly once from `open_safe` at take-over).
@@ -696,8 +696,22 @@ def selftest():
 
     # RecvResult logic (no real device): stub recv() and exercise the
     # matched / timeout / maxlen-overflow branches.
-    import importlib
-    hc = importlib.import_module("holdcom")
+    import sys, importlib.util
+    # selftest needs the module that defines recv_until. When run as a script
+    # (incl. the Homebrew binary, installed as `holdcom` WITHOUT a .py suffix
+    # and therefore NOT importable as module `holdcom`), holdcom is __main__;
+    # use that directly. Fall back to by-name import (pip / a holdcom.py on
+    # PATH), then to loading straight from __file__ so selftest passes under
+    # every install form.
+    hc = sys.modules.get("__main__")
+    if not hasattr(hc, "recv_until"):
+        try:
+            hc = importlib.import_module("holdcom")
+        except ModuleNotFoundError:
+            spec = importlib.util.spec_from_file_location(
+                "holdcom_self", os.path.abspath(__file__))
+            hc = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(hc)
     orig_recv = hc.recv
     try:
         hc.recv = lambda fd, timeout=1.0, n=4096: b"abc MATCH def"

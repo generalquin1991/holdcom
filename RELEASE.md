@@ -51,7 +51,9 @@ holdcom selftest           # 静态扫描 + pty 回环通过
 
 ## 当前版本
 
-- `0.1.9` — 最新（见 `git tag` 与两处版本号）
+- `0.1.10` — 最新（见 `git tag` 与两处版本号）
+  - **修复 `selftest` 在 brew 通道下失败**：brew 把脚本装成 `bin/holdcom`（无 `.py` 后缀），`import_module("holdcom")` 找不到自身；改为优先用 `__main__` 模块，回退按名导入、再回退按 `__file__` 直接加载。`selftest` 现在三种安装形态（pip / bash / brew）都能过。
+- `0.1.9` — 上一版
   - **修复真机 hang（你插 ESP 测试时踩到的真实跨平台 bug）**：ESP 类开发板在 `open()` 时驱动拉高 DTR → MCU 复位 → 设备重新枚举、节点瞬间消失。此时 macOS 上 `select()` 会**无视超时永久阻塞**，命令卡死 120s 才被 harness 杀掉，而非报告「断开」。这正是上一条「断开要分别报告、别统一成模糊错误」要覆盖的场景。
   - **SIGALRM 看门狗（绝不 hang）**：`recv`/`recv-until`/`txn` 内置主线程 `SIGALRM` 看门狗，`select()` 超时后被强制打断；再探测 fd：确认 `ENXIO/ENODEV/EIO` → 归类 **`disconnected` (exit 3)**，否则 **`timeout` (exit 2)**。死 fd 在 `~timeout+1s` 内必返回，绝不 120s 挂死。
   - 单测 + 打桩回归：死 fd 无视超时 → 2s 内返回 `TIMEOUT` 或 `DISCONNECTED`（不再 hang）；pty 回环、hex/UTF-8 无损发送匹配、边界/分类全绿。
