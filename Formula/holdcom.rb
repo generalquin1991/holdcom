@@ -25,9 +25,9 @@
 class Holdcom < Formula
   desc "On-demand serial take-over without resetting the MCU (picocom-like)"
   homepage "https://github.com/generalquin1991/holdcom"
-  url "https://github.com/generalquin1991/holdcom/archive/refs/tags/v0.1.8.tar.gz"
-  sha256 "a3b45ed4fdbe0249342345c37081389fabe59a5ae86c4017f68f4b9779729240"
-  version "0.1.8"
+  url "https://github.com/generalquin1991/holdcom/archive/refs/tags/v0.1.9.tar.gz"
+  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
+  version "0.1.9"
   license "MIT"
 
   # No `depends_on "python"`: the script is pure stdlib and uses the
@@ -44,6 +44,6 @@ class Holdcom < Formula
 
   test do
     assert_match "usage: holdcom", shell_output("#{bin}/holdcom --help")
-    assert_match "holdcom 0.1.8", shell_output("#{bin}/holdcom --version")
+    assert_match "holdcom 0.1.9", shell_output("#{bin}/holdcom --version")
   end
 end

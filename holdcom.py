@@ -52,6 +52,7 @@ import errno
 import fcntl
 import os
 import select
+import signal
 import struct
 import sys
 import termios
@@ -59,7 +60,7 @@ import threading
 import time
 import typing
 
-__version__ = "0.1.8"
+__version__ = "0.1.9"
 
 # TIOCM* constants mean modem-line control. They are permitted ONLY inside
 # `set_idle_state` (called exactly once from `open_safe` at take-over).
@@ -327,14 +328,105 @@ def close_safe(fd):
     os.close(fd)
 
 
+class _SelectInterrupted(Exception):
+    """Raised when the SIGALRM watchdog fires because select() ignored its
+    timeout. This is a known macOS/Linux quirk: when a serial device vanishes
+    (unplugged, or reset/re-enumerated) the fd stays open but select() can
+    block forever, ignoring the timeout argument. The watchdog guarantees we
+    return and can classify the event as a disconnect instead of hanging."""
+
+
+def _alarm_handler(signum, frame):
+    raise _SelectInterrupted()
+
+
+def _probe_dead(fd):
+    """Non-destructively determine whether `fd` is a dead (disconnected) serial
+    device. Raises `PortDisconnected` if the device is gone; returns normally
+    (does NOT consume data) if it is merely idle. Called only on the
+    alarm-interrupt path, so there is no risk of stealing a byte the caller
+    expects from a normal timeout."""
+    r, _, _ = select.select([fd], [], [], 0)
+    if not r:
+        return  # not readable => just no data yet, device alive
+    # select(0) claims readable: a live device would yield a byte; a dead tty
+    # reports readable-but-read-fails. Probe non-blocking to tell them apart.
+    prev = None
+    try:
+        prev = os.get_blocking(fd)
+        os.set_blocking(fd, False)
+        try:
+            os.read(fd, 1)
+            return  # actually got a byte (alive) — leave it for the caller
+        except BlockingIOError:
+            return  # lied, no data, alive
+        except OSError as e:
+            if e.errno in (errno.ENXIO, errno.ENODEV, errno.EIO):
+                raise PortDisconnected(e.errno, str(e)) from e
+            return
+    finally:
+        if prev is not None:
+            try:
+                os.set_blocking(fd, prev)
+            except OSError:
+                pass
+
+
+def _select_watchdog(fd, write, timeout):
+    """select() that CANNOT hang past `timeout` even on a dead serial fd.
+
+    Returns True if `fd` is ready (read or write, per `write`), False on a
+    normal timeout. Raises `PortDisconnected` if select() ignored its timeout
+    (dead fd) and the device is confirmed gone.
+
+    A SIGALRM backstop is installed (main thread only; other threads fall back
+    to the plain select timeout, best effort) so a vanished device cannot leave
+    recv/send blocked indefinitely — exactly the "disconnect must be reported,
+    not collapsed into a vague hang" requirement."""
+    if timeout <= 0:
+        timeout = 0
+    use_alarm = (timeout > 0
+                 and threading.current_thread() is threading.main_thread()
+                 and hasattr(signal, "SIGALRM"))
+    old = None
+    if use_alarm:
+        try:
+            old = signal.signal(signal.SIGALRM, _alarm_handler)
+            signal.alarm(int(timeout) + 1)
+        except (ValueError, OSError, RuntimeError):
+            use_alarm = False
+    try:
+        if write:
+            _, w, _ = select.select([], [fd], [], timeout)
+            if w:
+                return True
+        else:
+            r, _, _ = select.select([fd], [], [], timeout)
+            if r:
+                return True
+        return False  # normal timeout: select worked, device alive
+    except _SelectInterrupted:
+        # select ignored its timeout — almost always a dead fd. Probe to tell
+        # a genuine disconnect from a mere stall.
+        if not write:
+            _probe_dead(fd)  # raises PortDisconnected if the device is gone
+        return False
+    finally:
+        if use_alarm:
+            signal.alarm(0)
+            if old is not None:
+                try:
+                    signal.signal(signal.SIGALRM, old)
+                except (ValueError, OSError):
+                    pass
+
+
 def _readable(fd, timeout):
-    r, _, _ = select.select([fd], [], [], timeout)
-    return bool(r)
+    return _select_watchdog(fd, False, timeout)
 
 
 def _writable(fd, timeout):
-    _, w, _ = select.select([], [fd], [], timeout)
-    return bool(w)
+    return _select_watchdog(fd, True, timeout)
 
 
 def send(fd, data, timeout=5.0):

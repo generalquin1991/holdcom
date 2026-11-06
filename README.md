@@ -96,6 +96,16 @@ real cause. The raw serial bytes always go to **stdout** (for piping); the
 status line goes to stderr. Check the exit code / `.status`, never assume
 non-empty output means a match.
 
+> **No-Hang Guarantee on disconnect.** On macOS/Linux, when a serial device
+> vanishes mid-wait (unplugged, or reset/re-enumerated so its fd goes dead),
+> `select()` can **ignore its timeout and block forever** — which would make
+> `recv`/`recv-until`/`txn` hang instead of reporting the problem. `holdcom`
+> installs a `SIGALRM` watchdog (main thread) so a dead fd can never stall past
+> `timeout` (+1 s). After the watchdog fires it probes the fd: a confirmed
+> `ENXIO`/`ENODEV`/`EIO` is reported as **`disconnected` (exit 3)**, otherwise
+> as **`timeout` (exit 2)**. A stalled-but-alive port is therefore reported,
+> never silently hung.
+
 ### `txn` — one takeover, send → wait → release
 
 Firing separate `send` and `recv-until` invocations opens and closes the port
