@@ -51,7 +51,12 @@ holdcom selftest           # 静态扫描 + pty 回环通过
 
 ## 当前版本
 
-- `0.1.7` — 最新（见 `git tag` 与两处版本号）
+- `0.1.8` — 最新（见 `git tag` 与两处版本号）
+  - **参数边界明确化**：`timeout`/`baud` 必须 > 0（否则 usage 64）；空匹配串拒绝（64）；`recv-until`/`txn` 新增 `--maxlen`（默认 16 MiB），超界返回 `error`(1) 而非无限增长内存；非法 `--hex` 拒绝（64）
+  - **字节/文本语义**：发送 TEXT 默认 UTF-8，新增 `--hex`/`--send-hex`/`--until-hex` 发/匹配裸字节；`recv-until`/`--until` 按 **字节** 在原始流上匹配（永不解码文本）；原始串口输出到 stdout **恒为无损字节**，绝不解码
+  - **跨平台错误分级**：打开失败分为 not-found / busy / permission / unsupported / error，各自独立退出码（3/4/5/6/1），不再统一成模糊 error；运行时断开仍归 disconnected(3)
+  - 退出码表扩展：0/1/2/3/4/5/6/64
+- `0.1.7` — 上一版
   - recv-until 区分 matched/timeout/disconnected/error，返回明确退出码（0/2/3/1）
   - `status` 改名 `config`（报告将要应用的配置，不开端口、不查实时线路电平）；`status` 保留为废弃别名
   - 新增事务接口：库 `Session` 类 + CLI `txn`（一次接管内 send→等待→释放）

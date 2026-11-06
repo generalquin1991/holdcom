@@ -21,17 +21,31 @@ Static guarantee: TIOCM* ioctls appear ONLY in `set_idle_state` (called at most
 once from `open_safe`, and only when an override is requested). Enforced by
 `selftest` (AST scan per function).
 
-Two programmatic building blocks sit on top of the byte path:
-  * `recv_until()` returns a `RecvResult` whose `.status` is one of MATCHED /
-    TIMEOUT / DISCONNECTED / ERROR — so a caller can tell a real match from a
-    timeout or a gone device instead of blindly treating returned bytes as a win.
-  * `Session` is a context manager that holds ONE take-over open so the caller
-    can send -> wait -> release in a single controlled transaction (no gaps
-    between separate CLI invocations). The CLI `txn` subcommand is the
-    scriptable form of the same idea.
+------------------------------------------------------------------------
+TEXT vs BYTES (serial is a byte stream)
+------------------------------------------------------------------------
+  * Sending: `send`/`--send` take TEXT and encode it as UTF-8. Pass `--hex`
+    (or `--send-hex`) to send raw bytes expressed as a hex string instead.
+  * Matching: `recv-until`/`--until` are matched BYTE-WISE over the raw stream
+    — the pattern is encoded as UTF-8 (or hex) and looked for as a byte
+    sequence, never decoded as text. This is lossless for any byte, including
+    multi-byte UTF-8 characters and binary payloads.
+  * Output: captured serial bytes are written to stdout (and `--output`) as
+    RAW BYTES, never decoded. Piping to a file gives the exact bytes on the
+    wire. stdout stays pure serial data; status/diagnostics go to stderr.
+
+------------------------------------------------------------------------
+EXPLICIT OUTCOMES (so a non-match is never judged success)
+------------------------------------------------------------------------
+  recv-until / txn report `matched / timeout / disconnected / error`, and use
+  distinct exit codes (see EXIT_*). A timeout, a device disconnect, an
+  unsupported baud, a busy port, etc. are all reported SEPARATELY — never
+  collapsed into one vague "error".
+------------------------------------------------------------------------
 """
 import argparse
 import ast
+import contextlib
 import dataclasses
 import enum
 import errno
@@ -45,11 +59,44 @@ import threading
 import time
 import typing
 
-__version__ = "0.1.7"
+__version__ = "0.1.8"
 
 # TIOCM* constants mean modem-line control. They are permitted ONLY inside
 # `set_idle_state` (called exactly once from `open_safe` at take-over).
 # `selftest` enforces this confinement via an AST scan per function.
+
+# Default cap on how many bytes recv-until will accumulate before giving up
+# with an explicit ERROR (instead of growing memory without bound when the
+# pattern never arrives). Override with --maxlen.
+RECV_MAXLEN_DEFAULT = 16 * 1024 * 1024  # 16 MiB
+
+# Exit codes — distinct so a caller can tell exactly what happened.
+EXIT_OK = 0          # success / matched
+EXIT_ERROR = 1       # unexpected serial I/O failure (runtime)
+EXIT_TIMEOUT = 2     # pattern not found within -t
+EXIT_DISCONNECT = 3  # device vanished (mid-wait) OR not present at open
+EXIT_BUSY = 4        # another process holds the port (exclusive open)
+EXIT_PERMISSION = 5  # permission denied
+EXIT_UNSUPPORTED = 6 # baud / termios capability not available on this platform
+EXIT_USAGE = 64      # bad arguments (timeout<=0, baud<=0, empty pattern, bad hex)
+
+
+class PortErrorCategory(enum.Enum):
+    NOTFOUND = "notfound"
+    BUSY = "busy"
+    PERMISSION = "permission"
+    UNSUPPORTED = "unsupported"
+    ERROR = "error"
+
+
+class PortError(OSError):
+    """A typed open/termios failure carrying a platform-independent category so
+    the CLI can report 'not found' / 'busy' / 'permission' / 'unsupported'
+    separately instead of a generic 'error'."""
+
+    def __init__(self, errno_code, message, category):
+        super().__init__(errno_code, message)
+        self.category = category
 
 
 class PortDisconnected(OSError):
@@ -79,11 +126,42 @@ class RecvResult:
         return self.status is RecvStatus.MATCHED
 
 
-# CLI exit codes so a non-match is never mistaken for success by a caller.
-EXIT_OK = 0
-EXIT_ERROR = 1
-EXIT_TIMEOUT = 2
-EXIT_DISCONNECT = 3
+# Map an errno from open()/tcgetattr() to a human category.
+_OPEN_ERRNO_CATEGORY = {
+    errno.ENOENT: PortErrorCategory.NOTFOUND,
+    errno.ENXIO: PortErrorCategory.NOTFOUND,
+    errno.ENODEV: PortErrorCategory.NOTFOUND,
+    errno.EBUSY: PortErrorCategory.BUSY,
+    errno.EACCES: PortErrorCategory.PERMISSION,
+    errno.EPERM: PortErrorCategory.PERMISSION,
+    errno.ENOTTY: PortErrorCategory.UNSUPPORTED,
+    errno.EINVAL: PortErrorCategory.UNSUPPORTED,
+    errno.EOPNOTSUPP: PortErrorCategory.UNSUPPORTED,
+    errno.ENOSYS: PortErrorCategory.UNSUPPORTED,
+}
+
+_CATEGORY_MESSAGE = {
+    PortErrorCategory.NOTFOUND: "device not found or unplugged",
+    PortErrorCategory.BUSY: "device is busy (held by another process via exclusive open)",
+    PortErrorCategory.PERMISSION: "permission denied (try sudo or fix device ownership)",
+    PortErrorCategory.UNSUPPORTED: "not a usable serial terminal on this platform",
+    PortErrorCategory.ERROR: "serial open failed",
+}
+
+# Map a PortError category to its CLI exit code.
+CATEGORY_EXIT = {
+    PortErrorCategory.NOTFOUND: EXIT_DISCONNECT,
+    PortErrorCategory.BUSY: EXIT_BUSY,
+    PortErrorCategory.PERMISSION: EXIT_PERMISSION,
+    PortErrorCategory.UNSUPPORTED: EXIT_UNSUPPORTED,
+    PortErrorCategory.ERROR: EXIT_ERROR,
+}
+
+
+def _raise_port_error(e, port):
+    cat = _OPEN_ERRNO_CATEGORY.get(e.errno, PortErrorCategory.ERROR)
+    msg = f"{port}: {e.strerror} — {_CATEGORY_MESSAGE[cat]}"
+    raise PortError(e.errno, msg, cat)
 
 
 def open_safe(port, baud=None, raw=False, dtr_high=None, rts_high=None):
@@ -94,71 +172,109 @@ def open_safe(port, baud=None, raw=False, dtr_high=None, rts_high=None):
     None). If an idle level is requested via --idle-dtr/--idle-rts, it is
     applied exactly once, AFTER tcsetattr (which can reset the lines on some
     drivers), mirroring how picocom calls set_dtr_rts() after term_apply.
+
+    Open/termios failures are raised as a typed `PortError` with a clear
+    category (NOTFOUND / BUSY / PERMISSION / UNSUPPORTED / ERROR) so the caller
+    can report the real cause instead of a vague error.
     """
     flags = os.O_RDWR | getattr(os, "O_NOCTTY", 0) | os.O_NONBLOCK
-    fd = os.open(port, flags)
-
-    # Single holder: prevent a second process from opening the same port.
     try:
-        fcntl.ioctl(fd, termios.TIOCEXCL, 0)
-    except (AttributeError, OSError) as e:
-        sys.stderr.write(f"warn: TIOCEXCL unavailable ({e}); continuing without exclusivity\n")
-
-    attrs = termios.tcgetattr(fd)
-    # Clear HUPCL so close() will NOT drop DTR/RTS (--noreset semantics).
-    attrs[2] &= ~termios.HUPCL
-
-    if raw:
-        # cfmakeraw equivalent. This only changes line-discipline flags,
-        # never the modem-control bits.
-        attrs[0] &= ~(termios.IGNBRK | termios.BRKINT | termios.PARMRK
-                      | termios.ISTRIP | termios.INLCR | termios.IGNCR
-                      | termios.ICRNL | termios.IXON)
-        attrs[1] &= ~termios.OPOST
-        attrs[2] &= ~(termios.CSIZE | termios.PARENB)
-        attrs[2] |= termios.CS8
-        attrs[3] &= ~(termios.ECHO | termios.ECHONL | termios.ICANON
-                      | termios.ISIG | termios.IEXTEN)
-        attrs[6][termios.VMIN] = 1
-        attrs[6][termios.VTIME] = 0
-
-    baud_set_via_termios = False
-    if baud is not None:
-        bc = getattr(termios, f"B{baud}", None)
-        if bc is not None:
-            # Portable baud set: cfsetspeed is Linux-only. On macOS/BSD the
-            # ispeed/ospeed fields live at indices 4/5 of the tcgetattr list.
-            if hasattr(termios, "cfsetspeed"):
-                termios.cfsetspeed(attrs, bc)
+        fd = os.open(port, flags)
+    except OSError as e:
+        _raise_port_error(e, port)
+    try:
+        # Single holder: prevent a second process from opening the same port.
+        # Non-fatal (just a warning) when the platform/fd doesn't support it;
+        # but a hard error (e.g. EBUSY) means the port is already held -> we
+        # surface that as a BUSY error rather than silently continuing.
+        try:
+            fcntl.ioctl(fd, termios.TIOCEXCL, 0)
+        except (AttributeError, OSError, termios.error) as e:
+            if getattr(e, "errno", None) in (errno.ENOTTY, errno.EOPNOTSUPP,
+                                             errno.EINVAL):
+                sys.stderr.write("warn: TIOCEXCL unsupported on this fd; "
+                                 "continuing without exclusivity\n")
             else:
-                attrs[4] = bc
-                attrs[5] = bc
-            baud_set_via_termios = True
-        # else: no named B-constant for this rate (e.g. macOS lacks B2000000).
-        # Defer to the macOS IOSSIOSPEED ioctl below, which sets an arbitrary
-        # baud rate directly.
+                _raise_port_error(e, port)
 
-    # ONE tcsetattr: applies HUPCL-clear (+ optional baud/raw). On some
-    # drivers tcsetattr (term_apply) resets DTR/RTS, so if an idle level was
-    # requested we re-assert it immediately afterwards (picocom does the same).
-    termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        try:
+            attrs = termios.tcgetattr(fd)
+        except (OSError, termios.error) as e:
+            cat = _OPEN_ERRNO_CATEGORY.get(getattr(e, "errno", 0),
+                                          PortErrorCategory.UNSUPPORTED)
+            raise PortError(getattr(e, "errno", 0),
+                            f"{port}: {getattr(e, 'strerror', str(e))} — "
+                            f"{_CATEGORY_MESSAGE[cat]}",
+                            cat)
 
-    # macOS arbitrary baud: when there is no named B-constant, set the rate via
-    # the Darwin-only IOSSIOSPEED ioctl. This MUST run after tcsetattr, which
-    # would otherwise reset the speed to the value stored in the termios
-    # struct. IOSSIOSPEED only changes the line speed — it does NOT touch
-    # DTR/RTS, so the no-reset guarantee is preserved.
-    if baud is not None and not baud_set_via_termios:
-        if sys.platform == "darwin":
-            try:
-                fcntl.ioctl(fd, 0x80045402, struct.pack("I", baud))
-            except OSError as e:
-                raise ValueError(f"cannot set baud {baud} on this platform: {e}")
-        else:
-            raise ValueError(f"unsupported baud rate: {baud}")
+        # Clear HUPCL so close() will NOT drop DTR/RTS (--noreset semantics).
+        attrs[2] &= ~termios.HUPCL
 
-    set_idle_state(fd, dtr_high=dtr_high, rts_high=rts_high)
-    return fd
+        if raw:
+            # cfmakeraw equivalent. This only changes line-discipline flags,
+            # never the modem-control bits.
+            attrs[0] &= ~(termios.IGNBRK | termios.BRKINT | termios.PARMRK
+                          | termios.ISTRIP | termios.INLCR | termios.IGNCR
+                          | termios.ICRNL | termios.IXON)
+            attrs[1] &= ~termios.OPOST
+            attrs[2] &= ~(termios.CSIZE | termios.PARENB)
+            attrs[2] |= termios.CS8
+            attrs[3] &= ~(termios.ECHO | termios.ECHONL | termios.ICANON
+                          | termios.ISIG | termios.IEXTEN)
+            attrs[6][termios.VMIN] = 1
+            attrs[6][termios.VTIME] = 0
+
+        baud_set_via_termios = False
+        if baud is not None:
+            bc = getattr(termios, f"B{baud}", None)
+            if bc is not None:
+                # Portable baud set: cfsetspeed is Linux-only. On macOS/BSD the
+                # ispeed/ospeed fields live at indices 4/5 of the tcgetattr list.
+                if hasattr(termios, "cfsetspeed"):
+                    termios.cfsetspeed(attrs, bc)
+                else:
+                    attrs[4] = bc
+                    attrs[5] = bc
+                baud_set_via_termios = True
+            # else: no named B-constant for this rate (e.g. macOS lacks
+            # B2000000). Defer to the macOS IOSSIOSPEED ioctl below.
+
+        # ONE tcsetattr: applies HUPCL-clear (+ optional baud/raw). On some
+        # drivers tcsetattr (term_apply) resets DTR/RTS, so if an idle level
+        # was requested we re-assert it immediately afterwards (picocom does
+        # the same).
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+
+        # macOS arbitrary baud: when there is no named B-constant, set the rate
+        # via the Darwin-only IOSSIOSPEED ioctl. This MUST run after tcsetattr,
+        # which would otherwise reset the speed to the value stored in the
+        # termios struct. IOSSIOSPEED only changes the line speed — it does NOT
+        # touch DTR/RTS, so the no-reset guarantee is preserved.
+        if baud is not None and not baud_set_via_termios:
+            if sys.platform == "darwin":
+                try:
+                    fcntl.ioctl(fd, 0x80045402, struct.pack("I", baud))
+                except OSError as e:
+                    cat = _OPEN_ERRNO_CATEGORY.get(e.errno,
+                                                  PortErrorCategory.UNSUPPORTED)
+                    raise PortError(
+                        e.errno,
+                        f"cannot set baud {baud} on this platform: "
+                        f"{e.strerror} — {_CATEGORY_MESSAGE[cat]}",
+                        cat)
+            else:
+                raise PortError(
+                    0,
+                    f"unsupported baud rate {baud} on this platform "
+                    f"(no named B-constant and IOSSIOSPEED is macOS-only)",
+                    PortErrorCategory.UNSUPPORTED)
+
+        set_idle_state(fd, dtr_high=dtr_high, rts_high=rts_high)
+        return fd
+    except Exception:
+        # Don't leak the fd if anything above fails.
+        os.close(fd)
+        raise
 
 
 def set_idle_state(fd, dtr_high=None, rts_high=None):
@@ -187,7 +303,7 @@ def set_idle_state(fd, dtr_high=None, rts_high=None):
     if set_bits:
         try:
             fcntl.ioctl(fd, termios.TIOCMBIS, struct.pack("I", set_bits))
-        except OSError as e:
+        except (OSError, termios.error) as e:
             if e.errno in (errno.ENOTTY, errno.EOPNOTSUPP, errno.EINVAL):
                 sys.stderr.write("warn: modem-control ioctl unsupported on this "
                                  "device; idle-safe state skipped "
@@ -197,7 +313,7 @@ def set_idle_state(fd, dtr_high=None, rts_high=None):
     if clr_bits:
         try:
             fcntl.ioctl(fd, termios.TIOCMBIC, struct.pack("I", clr_bits))
-        except OSError as e:
+        except (OSError, termios.error) as e:
             if e.errno in (errno.ENOTTY, errno.EOPNOTSUPP, errno.EINVAL):
                 sys.stderr.write("warn: modem-control ioctl unsupported on this "
                                  "device; idle-safe state skipped "
@@ -222,8 +338,10 @@ def _writable(fd, timeout):
 
 
 def send(fd, data, timeout=5.0):
+    """Write `data` to the port. `data` may be `bytes` or `str`; a `str` is
+    encoded as UTF-8 (the single, documented text encoding for holdcom)."""
     if isinstance(data, str):
-        data = data.encode()
+        data = data.encode("utf-8")
     view = memoryview(data)
     while view:
         if not _writable(fd, timeout):
@@ -238,6 +356,9 @@ def send(fd, data, timeout=5.0):
 
 
 def recv(fd, timeout=1.0, n=4096):
+    """Read up to `n` bytes, waiting at most `timeout` seconds. Returns b"" on
+    timeout (no data). Raises `PortDisconnected` if the device vanished
+    (ENXIO/ENODEV/EIO), or a generic OSError for any other failure."""
     if _readable(fd, timeout):
         try:
             return os.read(fd, n)
@@ -253,19 +374,22 @@ def recv(fd, timeout=1.0, n=4096):
     return b""
 
 
-def recv_until(fd, pattern, timeout=5.0, n=4096):
-    """Wait until `pattern` appears in the received stream, or until `timeout`
-    seconds elapse. Returns a RecvResult whose `.status` is one of MATCHED /
-    TIMEOUT / DISCONNECTED / ERROR — so a caller can distinguish a real match
-    from a timeout or a gone device instead of blindly treating the returned
-    bytes as success.
+def recv_until(fd, pattern, timeout=5.0, n=4096, maxlen=RECV_MAXLEN_DEFAULT):
+    """Wait until `pattern` appears in the received byte stream, or until
+    `timeout` seconds elapse, or until `maxlen` bytes accumulate without a
+    match. Returns a RecvResult whose `.status` is one of MATCHED / TIMEOUT /
+    DISCONNECTED / ERROR.
 
-    DISCONNECTED is returned when the device vanishes mid-wait (e.g. USB
-    unplugged; ENXIO/EIO). ERROR covers any other I/O failure. The captured
-    bytes-so-far always travel along in `.data` for logging/debugging.
+    `pattern` is matched BYTE-WISE over the raw stream (encoded as UTF-8 if it
+    is a str, or left as-is if bytes). No text decoding happens.
+
+    DISCONNECTED: device vanished mid-wait (e.g. USB unplugged; ENXIO/EIO).
+    ERROR: other I/O failure, OR the buffer exceeded `maxlen` without a match
+           (so a runaway stream can't silently eat all memory).
+    The captured bytes-so-far always travel along in `.data` for logging.
     """
     if isinstance(pattern, str):
-        pattern = pattern.encode()
+        pattern = pattern.encode("utf-8")
     buf = bytearray()
     end = time.monotonic() + timeout
     while True:
@@ -280,6 +404,11 @@ def recv_until(fd, pattern, timeout=5.0, n=4096):
             return RecvResult(RecvStatus.ERROR, bytes(buf), str(e))
         if chunk:
             buf.extend(chunk)
+            if len(buf) > maxlen:
+                return RecvResult(
+                    RecvStatus.ERROR, bytes(buf),
+                    f"maxlen {maxlen} exceeded without a match "
+                    f"(stream never produced the pattern)")
             if pattern in buf:
                 return RecvResult(RecvStatus.MATCHED, bytes(buf))
 
@@ -293,9 +422,12 @@ class Session:
     an uncontrolled gap in between). Within one Session the caller controls the
     exact send -> wait -> release sequence.
 
+    Text passed to send()/recv_until() is encoded as UTF-8; to send or match
+    raw bytes, pass `bytes` directly (e.g. bytes.fromhex("de ad be ef")).
+
     Usage:
-        with Session("/dev/cu.usbmodem1101", baud=115200) as s:
-            s.send("AT\\r\\n")                      # pass $'...' from a shell
+        with Session("/dev/cu.usbmodem1101", baud=115200, raw=True) as s:
+            s.send("AT\\r\\n")                      # UTF-8 text
             res = s.recv_until("OK", timeout=2.0)
             if res.ok:
                 print("got response:", res.data)
@@ -316,8 +448,9 @@ class Session:
     def recv(self, timeout=1.0, n=4096):
         return recv(self.fd, timeout, n)
 
-    def recv_until(self, pattern, timeout=5.0, n=4096):
-        return recv_until(self.fd, pattern, timeout, n)
+    def recv_until(self, pattern, timeout=5.0, n=4096,
+                   maxlen=RECV_MAXLEN_DEFAULT):
+        return recv_until(self.fd, pattern, timeout, n, maxlen)
 
     def close(self):
         if self.fd is not None:
@@ -335,7 +468,8 @@ class Session:
 class _Tee:
     """Write serial bytes to stdout AND (optionally) a file. Used by --output
     so the default always stays stdout and holdcom never writes to /tmp unless
-    the caller points --output there explicitly."""
+    the caller points --output there explicitly. Bytes are written as-is
+    (lossless); nothing is ever decoded."""
 
     def __init__(self, path=None):
         self._f = open(path, "wb") if path else None
@@ -373,75 +507,17 @@ def _exit_for_status(status):
     }[status]
 
 
-def console(port, baud=None, raw=True, dtr_high=None, rts_high=None,
-           ctrl_c_quit=True, output=None):
-    """Interactive console for a human. Attach = take over; Ctrl-] = release.
-    `output`, if given, also saves the serial stream to that file (stdout is
-    still shown)."""
-    import tty
-    tee = _Tee(output)
-    fd = open_safe(port, baud=baud, raw=raw, dtr_high=dtr_high, rts_high=rts_high)
-    try:
-        stdin_fd = sys.stdin.fileno()
-        old = termios.tcgetattr(stdin_fd)
-        tty.setraw(stdin_fd)
-    except Exception:
-        old = None
-
-    stop = threading.Event()
-
-    def reader():
-        while not stop.is_set():
-            if _readable(sys.stdin.fileno(), 0.1):
-                try:
-                    ch = os.read(sys.stdin.fileno(), 1)
-                except OSError:
-                    break
-                if ch == b"\x1d":  # Ctrl-]
-                    stop.set()
-                    break
-                if ctrl_c_quit and ch == b"\x03":  # Ctrl-C
-                    stop.set()
-                    break
-                try:
-                    send(fd, ch, timeout=1.0)
-                except Exception:
-                    stop.set()
-                    break
-
-    def writer():
-        while not stop.is_set():
-            try:
-                data = recv(fd, 0.1, 1024)
-            except OSError as e:
-                # Device gone (e.g. USB unplugged -> ENXIO on macOS) or other
-                # serial I/O failure. Don't dump a raw traceback; tell the user
-                # and let the console exit gracefully.
-                sys.stderr.write(f"\n[console] serial I/O error: {e} "
-                                 "(device disconnected?)\n")
-                stop.set()
-                break
-            if data:
-                tee.write(data)
-
-    t_r = threading.Thread(target=reader, daemon=True)
-    t_w = threading.Thread(target=writer, daemon=True)
-    t_r.start()
-    t_w.start()
-    sys.stderr.write(f"[console] attached to {port}; "
-                     f"Ctrl-] or Ctrl-C to quit (Ctrl-C passthrough: -I)\n")
-    try:
-        while not stop.is_set():
-            t_r.join(0.2)
-    finally:
-        stop.set()
-        t_r.join(0.5)
-        t_w.join(0.5)
-        if old is not None:
-            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
-        tee.close()
-        close_safe(fd)
-        sys.stderr.write("[console] released\n")
+def _to_bytes(text, hex_flag):
+    """Resolve a CLI argument to the bytes that will be sent / matched.
+    With `hex_flag`, `text` is parsed as a hex string (spaces ignored) into
+    raw bytes. Otherwise `text` stays a str and is UTF-8 encoded later by
+    send()/recv_until()."""
+    if hex_flag:
+        try:
+            return bytes.fromhex(text.replace(" ", ""))
+        except ValueError as e:
+            raise ValueError(f"invalid hex value {text!r}: {e}")
+    return text
 
 
 def _cmd_config(port, args):
@@ -525,6 +601,27 @@ def selftest():
         close_safe(fd)
         os.close(master)
     print("OK: pty loopback — send/recv byte path verified, open/close clean")
+
+    # RecvResult logic (no real device): stub recv() and exercise the
+    # matched / timeout / maxlen-overflow branches.
+    import importlib
+    hc = importlib.import_module("holdcom")
+    orig_recv = hc.recv
+    try:
+        hc.recv = lambda fd, timeout=1.0, n=4096: b"abc MATCH def"
+        r = hc.recv_until(0, "MATCH", timeout=2.0)
+        assert r.status is hc.RecvStatus.MATCHED and r.ok, r
+
+        hc.recv = lambda fd, timeout=1.0, n=4096: b"nope"
+        r = hc.recv_until(0, "ZZZ", timeout=0.3)
+        assert r.status is hc.RecvStatus.TIMEOUT, r
+
+        hc.recv = lambda fd, timeout=1.0, n=4096: b"xxxxxxxxxx"
+        r = hc.recv_until(0, "NEVER", timeout=2.0, maxlen=25)
+        assert r.status is hc.RecvStatus.ERROR and "maxlen" in (r.error or ""), r
+    finally:
+        hc.recv = orig_recv
+    print("OK: recv_until logic — matched / timeout / maxlen-overflow verified")
     return 0
 
 
@@ -556,14 +653,25 @@ DESCRIPTION = (
     "  holdcom -b 115200                 omit it -> auto-use the only device\n"
     "Omit the command to drop into an interactive console.\n"
     "\n"
+    "TEXT vs BYTES: send / --send take TEXT (UTF-8). Use --hex (or --send-hex /\n"
+    "--until-hex) to send/match RAW BYTES (hex string). Matching is byte-wise\n"
+    "over the raw stream. Raw serial output to stdout is ALWAYS lossless bytes\n"
+    "(never decoded).\n"
+    "\n"
     "recv-until / txn report an explicit status (matched / timeout /\n"
     "disconnected / error) and use distinct exit codes, so a non-match is\n"
-    "never mistaken for success."
+    "never mistaken for success. Open failures are reported separately as\n"
+    "not-found / busy / permission / unsupported."
 )
 
 OUTPUT_HELP = ("write captured serial data to this file as well as stdout "
                "(audit log). Default: stdout only; holdcom never writes to "
                "/tmp unless you point --output there.")
+
+EXIT_HELP = (
+    "exit codes: 0=ok/matched 1=error 2=timeout 3=disconnected/not-found "
+    "4=busy 5=permission 6=unsupported 64=usage(bad timeout/baud/pattern/hex)"
+)
 
 EPILOG = (
     "examples:\n"
@@ -579,8 +687,13 @@ EPILOG = (
     "console: Ctrl-] or Ctrl-C quits; -I passes Ctrl-C through to the device\n"
     "(e.g. for a MicroPython REPL that needs Ctrl-C).\n"
     "\n"
+    f"{EXIT_HELP}\n"
+    "\n"
     "Library: `from holdcom import Session, recv_until, RecvResult, RecvStatus`\n"
-    "for scripted send -> wait -> release without subprocess gaps."
+    "for scripted send -> wait -> release without subprocess gaps.\n"
+    "\n"
+    "Encoding: send/--send are UTF-8 text unless --hex/--send-hex given; "
+    "recv-until/--until match byte-wise. Output is raw bytes (lossless)."
 )
 
 
@@ -596,7 +709,7 @@ def build_parser():
                    help="serial port, e.g. /dev/cu.usbmodem1101 "
                         "(positional also works; omit to auto-pick the only device)")
     p.add_argument("-b", "--baud", type=int, default=None,
-                   help="baud rate (optional; default: inherit driver setting)")
+                   help="baud rate (must be > 0; default: inherit driver setting)")
     p.add_argument("-r", "--raw", action="store_true",
                    help="raw mode: disable echo/line editing at take-over "
                         "(no modem touch)")
@@ -612,13 +725,26 @@ def build_parser():
                         "REPL); by default Ctrl-C also quits holdcom")
     p.add_argument("--output", default=None, help=OUTPUT_HELP)
     sub = p.add_subparsers(dest="cmd")
-    sub.add_parser("send").add_argument("data")
-    ru = sub.add_parser("recv-until")
-    ru.add_argument("pattern")
-    ru.add_argument("-t", "--timeout", type=float, default=5.0)
+    s = sub.add_parser("send",
+                       help="send TEXT (UTF-8) to the port; --hex to send raw bytes")
+    s.add_argument("data", help="text to send (UTF-8). Use --hex for raw bytes.")
+    s.add_argument("--hex", action="store_true",
+                   help="interpret `data` as a hex string (raw bytes)")
+    ru = sub.add_parser("recv-until",
+                        help="read until PATTERN appears, or timeout/maxlen")
+    ru.add_argument("pattern",
+                    help="byte/UTF-8 pattern to wait for (--hex for raw bytes)")
+    ru.add_argument("-t", "--timeout", type=float, default=5.0,
+                    help="max seconds to wait (must be > 0)")
+    ru.add_argument("--maxlen", type=int, default=RECV_MAXLEN_DEFAULT,
+                    help=f"max bytes to accumulate before giving up "
+                         f"(default {RECV_MAXLEN_DEFAULT})")
+    ru.add_argument("--hex", action="store_true",
+                   help="interpret `pattern` as a hex string (raw bytes)")
     ru.add_argument("--output", default=None, help=OUTPUT_HELP)
-    rr = sub.add_parser("recv")
-    rr.add_argument("-t", "--timeout", type=float, default=1.0)
+    rr = sub.add_parser("recv", help="read once, up to -t seconds")
+    rr.add_argument("-t", "--timeout", type=float, default=1.0,
+                    help="max seconds to wait (must be > 0)")
     rr.add_argument("--output", default=None, help=OUTPUT_HELP)
     cfg = sub.add_parser("config",
                          help="show the resolved take-over configuration "
@@ -628,12 +754,20 @@ def build_parser():
                          help="transaction: open once, optionally send, wait "
                               "for a pattern (or time out), then release")
     txn.add_argument("--send", default=None,
-                     help="data to send at take-over (optional). Use shell "
-                          "$'...' for control chars, e.g. $'AT\\r\\n'")
+                     help="TEXT to send at take-over (UTF-8). Use --send-hex "
+                          "for raw bytes. Shell $'...' for control chars")
+    txn.add_argument("--send-hex", default=None,
+                     help="hex string to send at take-over (raw bytes)")
     txn.add_argument("--until", default=None,
-                     help="wait until this pattern appears in the response")
+                     help="wait until this PATTERN appears in the response "
+                          "(--until-hex for raw bytes)")
+    txn.add_argument("--until-hex", default=None,
+                     help="hex string pattern to wait for (raw bytes)")
     txn.add_argument("-t", "--timeout", type=float, default=5.0,
-                     help="max seconds to wait for --until (or for a plain capture)")
+                     help="max seconds to wait for --until (must be > 0)")
+    txn.add_argument("--maxlen", type=int, default=RECV_MAXLEN_DEFAULT,
+                     help=f"max bytes to accumulate before giving up "
+                          f"(default {RECV_MAXLEN_DEFAULT})")
     txn.add_argument("--output", default=None, help=OUTPUT_HELP)
     con = sub.add_parser("console",
                          help="interactive console (default when no command given)")
@@ -686,6 +820,22 @@ def _auto_detect_port():
             if not any(s in dev for s in skip):
                 found.add(dev)
     return sorted(found)
+
+
+def _try_open(port, baud, raw, idle_dtr, idle_rts):
+    """Open the port, turning platform errors into a clear message + exit code.
+    Returns (fd, None) on success or (None, exit_code) on error."""
+    try:
+        return open_safe(port, baud=baud, raw=raw,
+                         dtr_high=idle_dtr, rts_high=idle_rts), None
+    except PortError as e:
+        sys.stderr.write(f"error: {e}\n")
+        return None, CATEGORY_EXIT[e.category]
+
+
+def _usage_error(msg):
+    sys.stderr.write(f"error: {msg}\n")
+    return EXIT_USAGE
 
 
 def main(argv=None):
@@ -741,16 +891,32 @@ def main(argv=None):
                 sys.stderr.write(f"  {c}\n")
             return 2
 
+    # ---- parameter-boundary validation (before any port open) ----
+    if args.baud is not None and args.baud <= 0:
+        return _usage_error("baud must be > 0")
+
+    if args.cmd in ("recv", "recv-until", "txn"):
+        if args.timeout is not None and args.timeout <= 0:
+            return _usage_error(f"timeout must be > 0 (got {args.timeout})")
+
     if args.cmd == "send":
-        fd = open_safe(port, args.baud, args.raw, idle_dtr, idle_rts)
         try:
-            send(fd, args.data)
+            payload = _to_bytes(args.data, args.hex)
+        except ValueError as e:
+            return _usage_error(str(e))
+        fd, rc = _try_open(port, args.baud, args.raw, idle_dtr, idle_rts)
+        if fd is None:
+            return rc
+        try:
+            send(fd, payload)
         finally:
             close_safe(fd)
         return 0
 
     if args.cmd == "recv":
-        fd = open_safe(port, args.baud, args.raw, idle_dtr, idle_rts)
+        fd, rc = _try_open(port, args.baud, args.raw, idle_dtr, idle_rts)
+        if fd is None:
+            return rc
         tee = _Tee(args.output)
         try:
             data = recv(fd, args.timeout)
@@ -761,10 +927,20 @@ def main(argv=None):
         return 0
 
     if args.cmd == "recv-until":
-        fd = open_safe(port, args.baud, args.raw, idle_dtr, idle_rts)
+        try:
+            pattern = _to_bytes(args.pattern, args.hex)
+        except ValueError as e:
+            return _usage_error(str(e))
+        if len(pattern) == 0:
+            return _usage_error("empty pattern (use a non-empty string or hex)")
+        if args.maxlen is not None and args.maxlen <= 0:
+            return _usage_error("maxlen must be > 0")
+        fd, rc = _try_open(port, args.baud, args.raw, idle_dtr, idle_rts)
+        if fd is None:
+            return rc
         tee = _Tee(args.output)
         try:
-            res = recv_until(fd, args.pattern, args.timeout)
+            res = recv_until(fd, pattern, args.timeout, maxlen=args.maxlen)
             _emit_recv_result(res, tee)
         finally:
             tee.close()
@@ -772,14 +948,46 @@ def main(argv=None):
         return _exit_for_status(res.status)
 
     if args.cmd == "txn":
-        fd = open_safe(port, args.baud, args.raw, idle_dtr, idle_rts)
+        send_bytes = None
+        if args.send is not None:
+            try:
+                send_bytes = _to_bytes(args.send, False)
+            except ValueError as e:
+                return _usage_error(str(e))
+        elif args.send_hex is not None:
+            try:
+                send_bytes = _to_bytes(args.send_hex, True)
+            except ValueError as e:
+                return _usage_error(str(e))
+        if send_bytes is not None and len(send_bytes) == 0:
+            return _usage_error("empty --send/--send-hex payload")
+
+        until = None
+        if args.until is not None:
+            try:
+                until = _to_bytes(args.until, False)
+            except ValueError as e:
+                return _usage_error(str(e))
+        elif args.until_hex is not None:
+            try:
+                until = _to_bytes(args.until_hex, True)
+            except ValueError as e:
+                return _usage_error(str(e))
+        if until is not None and len(until) == 0:
+            return _usage_error("empty --until/--until-hex pattern")
+        if args.maxlen is not None and args.maxlen <= 0:
+            return _usage_error("maxlen must be > 0")
+
+        fd, rc = _try_open(port, args.baud, args.raw, idle_dtr, idle_rts)
+        if fd is None:
+            return rc
         tee = _Tee(args.output)
         try:
-            if args.send is not None:
-                send(fd, args.send)
-                sys.stderr.write(f"[txn] sent {len(args.send)} bytes\n")
-            if args.until is not None:
-                res = recv_until(fd, args.until, args.timeout)
+            if send_bytes is not None:
+                send(fd, send_bytes)
+                sys.stderr.write(f"[txn] sent {len(send_bytes)} bytes\n")
+            if until is not None:
+                res = recv_until(fd, until, args.timeout, maxlen=args.maxlen)
                 _emit_recv_result(res, tee)
                 return _exit_for_status(res.status)
             # No --until: just capture whatever arrives within the timeout.
@@ -798,12 +1006,84 @@ def main(argv=None):
         return 0
 
     if args.cmd == "console":
-        console(port, args.baud, args.raw, idle_dtr, idle_rts,
-                ctrl_c_quit=not args.int_passthrough, output=args.output)
+        fd, rc = _try_open(port, args.baud, args.raw, idle_dtr, idle_rts)
+        if fd is None:
+            return rc
+        try:
+            _run_console_on_fd(fd, args)
+        finally:
+            close_safe(fd)
         return 0
 
     sys.stderr.write(f"error: unknown command {args.cmd}\n")
     return 2
+
+
+def _run_console_on_fd(fd, args):
+    """Drive the interactive console over an already-open fd (so the explicit
+    open-error handling in main applies consistently)."""
+    import tty
+    tee = _Tee(args.output)
+    try:
+        stdin_fd = sys.stdin.fileno()
+        old = termios.tcgetattr(stdin_fd)
+        tty.setraw(stdin_fd)
+    except Exception:
+        old = None
+
+    stop = threading.Event()
+
+    def reader():
+        while not stop.is_set():
+            if _readable(sys.stdin.fileno(), 0.1):
+                try:
+                    ch = os.read(sys.stdin.fileno(), 1)
+                except OSError:
+                    break
+                if ch == b"\x1d":  # Ctrl-]
+                    stop.set()
+                    break
+                if not args.int_passthrough and ch == b"\x03":  # Ctrl-C
+                    stop.set()
+                    break
+                try:
+                    send(fd, ch, timeout=1.0)
+                except Exception:
+                    stop.set()
+                    break
+
+    def writer():
+        while not stop.is_set():
+            try:
+                data = recv(fd, 0.1, 1024)
+            except PortDisconnected as e:
+                sys.stderr.write(f"\n[console] device disconnected: {e}\n")
+                stop.set()
+                break
+            except OSError as e:
+                sys.stderr.write(f"\n[console] serial I/O error: {e}\n")
+                stop.set()
+                break
+            if data:
+                tee.write(data)
+
+    t_r = threading.Thread(target=reader, daemon=True)
+    t_w = threading.Thread(target=writer, daemon=True)
+    t_r.start()
+    t_w.start()
+    sys.stderr.write(f"[console] attached to {args.port or '(auto)'} via open fd; "
+                     f"Ctrl-] or Ctrl-C to quit (Ctrl-C passthrough: -I)\n")
+    try:
+        while not stop.is_set():
+            t_r.join(0.2)
+    finally:
+        stop.set()
+        t_r.join(0.5)
+        t_w.join(0.5)
+        if old is not None:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old)
+        tee.close()
+        sys.stderr.write("[console] released\n")
 
 
 if __name__ == "__main__":

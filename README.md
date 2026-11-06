@@ -76,18 +76,25 @@ holdcom selftest
 
 `recv-until` no longer returns "success" just because bytes arrived. It prints a
 machine-readable status line on **stderr** and uses a distinct **exit code** so a
-caller can tell a real match from a timeout or a gone device:
+caller can tell a real match from a timeout, a gone device, a busy port, etc.:
 
-| exit | status (stderr) | meaning |
-|------|-----------------|---------|
-| `0`  | `matched`       | pattern found — real success |
-| `2`  | `timeout`       | pattern NOT found within `-t` |
-| `3`  | `disconnected`  | device vanished mid-wait (e.g. USB unplugged) |
-| `1`  | `error`         | other serial I/O failure |
+| exit | status / category           | meaning |
+|------|-----------------------------|---------|
+| `0`  | `matched`                   | pattern found — real success |
+| `1`  | `error`                     | unexpected serial I/O failure at runtime |
+| `2`  | `timeout`                   | pattern NOT found within `-t` |
+| `3`  | `disconnected` / not-found  | device vanished mid-wait **or** not present at open (unplugged?) |
+| `4`  | `busy`                      | another process holds the port (exclusive open) |
+| `5`  | `permission`                | permission denied (try `sudo` / fix ownership) |
+| `6`  | `unsupported`               | baud / termios capability not available on this platform |
+| `64` | `usage`                     | bad argument: timeout ≤ 0, baud ≤ 0, empty pattern, bad hex |
 
-The raw serial bytes always go to **stdout** (for piping); the status line goes
-to stderr. Check the exit code / `.status`, never assume non-empty output means
-a match.
+The open-stage categories (`not-found` / `busy` / `permission` / `unsupported`)
+are reported **separately** — macOS and Linux disagree on exclusive-open,
+disconnect, and some termios features, so a vague single "error" would hide the
+real cause. The raw serial bytes always go to **stdout** (for piping); the
+status line goes to stderr. Check the exit code / `.status`, never assume
+non-empty output means a match.
 
 ### `txn` — one takeover, send → wait → release
 
@@ -114,6 +121,31 @@ prints a warning and delegates to `config`.
 `recv`, `recv-until`, `txn` and `console` accept `--output <path>` to also write
 the captured serial stream to a file. The **default is always stdout**; holdcom
 never writes to `/tmp` unless you point `--output` there explicitly.
+
+### Bytes vs text (serial is a byte stream)
+
+- **Sending**: `send` / `--send` take **TEXT, encoded as UTF-8**. Use `--hex`
+  (or `--send-hex`) to send **raw bytes** expressed as a hex string.
+- **Matching**: `recv-until` / `--until` are matched **byte-wise** over the raw
+  stream — the pattern is encoded as UTF-8 (or hex) and looked for as a byte
+  sequence, never decoded as text. This is lossless for any byte, including
+  multi-byte UTF-8 and binary payloads.
+- **Output**: captured serial bytes are written to stdout (and `--output`) as
+  **RAW BYTES, never decoded**. Piping to a file gives the exact bytes on the
+  wire. stdout stays pure serial data; status/diagnostics go to stderr.
+
+### Defined parameter boundaries (no accidental results)
+
+- `timeout` (`-t`) **must be > 0** — a zero/negative timeout is a usage error
+  (exit 64), not an implicit "poll once".
+- `baud` (`-b`) **must be > 0** — `0` would map to `B0` (hang up) and is
+  rejected (exit 64).
+- **Empty pattern** is rejected (exit 64) — an empty match would "succeed"
+  immediately on zero bytes, which is exactly the accidental result to avoid.
+- `recv-until` / `txn` accumulate bytes up to `--maxlen` (default 16 MiB); if
+  the pattern never appears and the cap is exceeded, they return `error`
+  (exit 1) instead of growing memory without bound.
+- Invalid `--hex` is rejected with a clear message (exit 64).
 
 ### Library / transaction API
 
